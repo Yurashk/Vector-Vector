@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Dodge Runner</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            user-select: none;
+            -webkit-user-select: none;
+            margin: 0;
+            padding: 0;
+        }
+        html, body {
+            width: 100%;
+            /* 100dvh решает проблему срезанной высоты на мобилках */
+            height: 100dvh; 
+            background-color: #000000;
+            overflow: hidden;
+            touch-action: none; /* Запрещает свайпы браузера */
+        }
+        #game-container {
+            /* Ограничиваем ширину игры на больших экранах */
+            width: 100%;
+            max-width: 800px;
+            margin: 0 auto;
+            height: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+    </style>
+  <script type="module" crossorigin src="./assets/index-DNSdWNAV.js"></script>
+  <link rel="modulepreload" crossorigin href="./assets/phaser-BsMot369.js">
+</head>
+<body>
+    <div id="game-container"></div>
+</body>
+</html>
