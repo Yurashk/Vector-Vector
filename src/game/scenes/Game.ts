@@ -1,11 +1,66 @@
 import * as Phaser from "phaser";
 import { NeonShipRenderer } from "../NeonShipRenderer";
+import { gameServices } from "../../services/GameServicesManager";
+import { GameState, drawSciFiIcon } from "../ui/NeonUI";
+import { GameOverModal } from "../ui/GameOverModal";
 import {
+  getSkinById,
   getSelectedSkin,
   selectSkin,
   SPACESHIP_SKINS,
   SpaceshipSkin,
 } from "../spaceship-skins";
+
+// --- Рекорд в localStorage ---
+const HIGHSCORE_KEY = "dodge-runner-highscore";
+
+// Моноширинный шрифт всех цифр HUD — ровные колонки без «прыжков»
+const HUD_FONT = 'Consolas, "Courier New", monospace';
+
+// Геометрия плашки активного буста (иконка + узкий прогресс-бар)
+const BUFF_W = 95;
+const BUFF_H = 18;
+const BAR_W = 66;
+const BAR_X = -26;
+const BAR_Y = -2;
+const BAR_H = 4;
+// Стек бустов под кнопкой паузы: опущен ниже превью-полосок волн
+// (полоски рисуются на y≈40±8, поэтому начинаем со 72)
+const BUFF_STACK_X_OFFSET = -52; // от правого края: плашка 95px + марджин 5px
+const BUFF_STACK_Y_START = 72;
+const BUFF_STACK_STEP = 24;
+
+function loadHighscore(): number {
+  try {
+    const raw = localStorage.getItem(HIGHSCORE_KEY);
+    const parsed = raw ? parseInt(raw, 10) : 0;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function saveHighscore(value: number): void {
+  try {
+    localStorage.setItem(HIGHSCORE_KEY, String(value));
+  } catch {
+    // localStorage недоступен — играем без сохранения рекорда
+  }
+}
+
+/** Открыт ли скин при текущем уровне конструкторского отсека станции */
+function isSkinUnlocked(skin: SpaceshipSkin): boolean {
+  return (skin.requiredDesignLevel ?? 0) <= GameState.getStation().design;
+}
+
+// HUD активного буста: векторная иконка + узкий прогресс-бар времени
+interface BoostHud {
+  container: Phaser.GameObjects.Container;
+  barFill: Phaser.GameObjects.Graphics;
+  barWidth: number;
+  color: number;
+  tween?: Phaser.Tweens.Tween;
+}
 
 export class Game extends Phaser.Scene {
   // Контейнер игрока
@@ -19,26 +74,19 @@ export class Game extends Phaser.Scene {
 
   private isGameOver: boolean = false;
 
-  // Временное состояние тапа/свайпа на экране Game Over
-  private gameOverSwipeStartX: number = 0;
-  private gameOverSwipeActive: boolean = false;
-
-  // Элементы карусели на экране Game Over (обновляются при переключении)
-  private gameOverCarousel?: {
-    frame: Phaser.GameObjects.Graphics;
-    ship: Phaser.GameObjects.Graphics;
-    label: Phaser.GameObjects.Text;
-    size: number;
-  };
+  // Модальное окно Game Over (REVIVE временно выключен — см. showGameOver)
+  private gameOverModal?: GameOverModal;
 
   private obstacles!: Phaser.Physics.Arcade.Group;
   private boostsGroup!: Phaser.Physics.Arcade.Group;
+  private bombsGroup!: Phaser.Physics.Arcade.Group;
   private gateTriggers!: Phaser.Physics.Arcade.Group;
 
   // Состояние
-  private isLevelUpWave: boolean = false;
   private score: number = 0;
   private lives: number = 1;
+  // === БАЛАНС: жёсткий потолок доп. жизней
+  private maxLives: number = 15;
   private scoreMultiplier: number = 1;
   private isInvulnerable: boolean = false;
 
@@ -53,8 +101,12 @@ export class Game extends Phaser.Scene {
   private shieldTimer?: Phaser.Time.TimerEvent;
   private shieldBlinkTween?: Phaser.Tweens.Tween;
   private shieldAlpha: number = 1;
-  private shieldIndicator!: Phaser.GameObjects.Container;
-  private shieldIndicatorTween?: Phaser.Tweens.Tween;
+  private shieldArcs!: Phaser.GameObjects.Graphics;
+  private x2Hud!: BoostHud;
+  private shieldHud!: BoostHud;
+
+  // Хук для внешних SDK (реклама/аналитика): срабатывает при смене паузы
+  private onPauseChanged?: (paused: boolean) => void;
 
   // Таймер множителя X2
   private boostMultiplierTimer?: Phaser.Time.TimerEvent;
@@ -62,22 +114,54 @@ export class Game extends Phaser.Scene {
   // Прогрессия скорости
   private baseSpeed: number = 0.35;
   private currentSpeed: number = 0.35;
+  // === БАЛАНС === двухступенчатый рост скорости: до множителя x5 —
+  // быстрые +25% за уровень, дальше плавнее +16%; лимита нет
+  private readonly fastSpeedStepPerLevel: number = 0.25;
+  private readonly normalSpeedStepPerLevel: number = 0.16;
+  private readonly fastSpeedCapMultiplier: number = 5;
+  // === БАЛАНС: бонусы падают с фиксированной «вольной» скоростью,
+  // не зависящей от уровня игры, чтобы их можно было поймать на любой скорости
+  private boostFallSpeed: number = 0.3;
+  // === БАЛАНС === честные фиксированные длительности бустов
+  private readonly shieldDurationMs: number = 7000;
+  private readonly x2DurationMs: number = 8000;
+  // === БАЛАНС === шанс красной бомбы среди коллектиблов, %
+  private readonly bombChancePercent: number = 15;
   private speedLevel: number = 0;
+  // === БАЛАНС === уровни идут чаще: шаг между порогами растёт всего на
+  // +1 волну (4,5,6,7...), после таблицы продолжаем ×1.18 вместо ×1.25
   private speedThresholds: number[] = [
-    5, 12, 22, 34, 48, 64, 82, 102, 125, 150,
+    4, 9, 15, 22, 30, 39, 49, 60, 72, 85,
   ];
-  private speedMultiplierStep: number = 1.25;
 
   private spawnTimer!: Phaser.Time.TimerEvent;
   private baseSpawnDelay: number = 2200;
 
-  // --- БАЛАНС: превью волн на высоких скоростях ---
-  // Обычная длительность показа превью-полосок (мс)
+  // --- БАЛАНС: градация превью и Blind Mode на высоких скоростях ---
+  // Стандартное превью (мс) — держится до множителя x5
   private readonly basePreviewDelay: number = 800;
-  // Множитель скорости, с которого превью начинает сокращаться
-  private readonly previewShrinkAtMultiplier: number = 7;
-  // Минимальная длительность превью на пиковом множителе (мс)
-  private readonly minPreviewDelay: number = 320;
+  private readonly previewFullUntilMultiplier: number = 5;
+  // На x5→x6 превью плавно ужимается к промежуточным 400мс
+  private readonly previewMidDelay: number = 400;
+  private readonly previewFastAtMultiplier: number = 6;
+  // На x6→x8 сокращается 400мс → 150мс...
+  private readonly minPreviewDelay: number = 150;
+  // ...а с x8 включается Blind Mode: превью полностью отключено
+  private readonly blindModeMultiplier: number = 8;
+
+  /** Множитель скорости уровня: +25%/уровень до x5, дальше +16%, без потолка */
+  private getCurrentSpeedMult(): number {
+    const fastLevels = Math.round(
+      (this.fastSpeedCapMultiplier - 1) / this.fastSpeedStepPerLevel,
+    ); // уровень, на котором достигается x5 (16)
+    if (this.speedLevel <= fastLevels) {
+      return 1 + this.speedLevel * this.fastSpeedStepPerLevel;
+    }
+    return (
+      this.fastSpeedCapMultiplier +
+      (this.speedLevel - fastLevels) * this.normalSpeedStepPerLevel
+    );
+  }
 
   // Палитра препятствий по мере роста множителя скорости: синий → жёлтый → оранжевый → красный
   private readonly SPEED_COLOR_STOPS: number[] = [
@@ -89,14 +173,24 @@ export class Game extends Phaser.Scene {
   ];
 
   // UI элементы
-  private scoreText!: Phaser.GameObjects.Text;
   private livesText!: Phaser.GameObjects.Text;
   private speedText!: Phaser.GameObjects.Text;
-  private statusText!: Phaser.GameObjects.Text;
+  private pauseBtn!: Phaser.GameObjects.Container;
+  private pauseGlyph!: Phaser.GameObjects.Graphics;
+  private isPaused: boolean = false;
+  private levelBarContainer!: Phaser.GameObjects.Container;
+  private levelText!: Phaser.GameObjects.Text;
+  private levelBarFill!: Phaser.GameObjects.Graphics;
+
+  // --- Blind Mode (x8+): игра без превью волн ---
+  private blindModeActive: boolean = false;
+  private blindVignette?: Phaser.GameObjects.Graphics;
 
   // Управление
   private dragStartX: number = 0;
   private playerStartX: number = 0;
+  private dragStartY: number = 0;
+  private playerStartY: number = 0;
   private isDragging: boolean = false;
 
   // Размеры
@@ -114,39 +208,6 @@ export class Game extends Phaser.Scene {
     super("Game");
   }
 
-  private generateTextures() {
-    if (!this.textures.exists("heart_icon")) {
-      const graphics = this.make.graphics();
-      graphics.fillStyle(0xff3366, 1);
-      graphics.fillCircle(7, 7, 6);
-      graphics.fillCircle(17, 7, 6);
-      graphics.beginPath();
-      graphics.moveTo(1, 8);
-      graphics.lineTo(23, 8);
-      graphics.lineTo(12, 22);
-      graphics.closePath();
-      graphics.fillPath();
-      graphics.generateTexture("heart_icon", 24, 24);
-      graphics.destroy();
-    }
-
-    if (!this.textures.exists("lightning_icon")) {
-      const graphics = this.make.graphics();
-      graphics.fillStyle(0xffcc00, 1);
-      graphics.beginPath();
-      graphics.moveTo(14, 0);
-      graphics.lineTo(3, 13);
-      graphics.lineTo(11, 13);
-      graphics.lineTo(8, 24);
-      graphics.lineTo(21, 10);
-      graphics.lineTo(13, 10);
-      graphics.closePath();
-      graphics.fillPath();
-      graphics.generateTexture("lightning_icon", 24, 24);
-      graphics.destroy();
-    }
-  }
-
 create() {
     this.score = 0;
     this.lives = 1;
@@ -154,27 +215,24 @@ create() {
     this.isInvulnerable = false;
     this.melodyNoteIndex = 0;
     this.shieldAlpha = 1;
-    this.isLevelUpWave = false;
 
     this.currentSpeed = this.baseSpeed;
     this.speedLevel = 0;
     this.currentBorderColor = this.defaultBorderColor();
     this.isGameOver = false;
-    this.gameOverSwipeActive = false;
-    this.gameOverCarousel = undefined;
+    this.gameOverModal = undefined;
+    this.blindModeActive = false;
+    if (this.blindVignette) {
+      this.blindVignette.destroy();
+      this.blindVignette = undefined;
+    }
 
-    this.generateTextures();
     this.initAudio();
 
     const width = this.scale.width;
     const height = this.scale.height;
 
-    // --- 🌌 НЕОНОВЫЙ ТЁМНЫЙ ГРАДИЕНТНЫЙ ФОН ---
-    const bg = this.add.graphics();
-    bg.fillGradientStyle(0x050515, 0x050515, 0x0a0518, 0x0a0518, 1);
-    bg.fillRect(0, 0, width, height);
-
-    // --- 🕸️ НЕОНОВАЯ ФОНОВАЯ СЕТКА ПОВЕРХ ГРАДИЕНТА ---
+    // --- 🕸️ НЕОНОВАЯ ФОНОВАЯ СЕТКА ---
     const grid = this.add.graphics();
     grid.lineStyle(1, 0x00f3ff, 0.05);
 
@@ -190,9 +248,14 @@ create() {
     this.playerSize = Math.max(35, Math.floor(width * 0.08));
     this.playerBorder = this.add.graphics();
 
+    // Двойная дуга щита перед носом корабля (видна только при активном щите)
+    this.shieldArcs = this.add.graphics().setVisible(false);
+
     // Размер корабля подбираем под внутреннюю часть рамки,
     // чтобы он заполнял пространство внутри неё
     this.shipGraphics = NeonShipRenderer.create(this, this.currentSkin, this.shipRenderSize());
+    // === БАЛАНС: корабль на 5% уже по ширине (хитбокс не меняется)
+    this.shipGraphics.setScale(0.95, 1);
     this.tweens.add({
       targets: this.shipGraphics,
       alpha: { from: 0.72, to: 1 },
@@ -208,6 +271,7 @@ create() {
     this.playerContainer = this.add.container(width / 2, height - 80, [
       this.shipGraphics,
       this.playerBorder,
+      this.shieldArcs,
     ]);
 
     this.physics.add.existing(this.playerContainer);
@@ -221,50 +285,62 @@ create() {
     // Группы
     this.obstacles = this.physics.add.group();
     this.boostsGroup = this.physics.add.group();
+    this.bombsGroup = this.physics.add.group();
     this.gateTriggers = this.physics.add.group();
 
-    // UI
-    this.scoreText = this.add.text(20, 18, "Level: 0", {
-      fontSize: "20px",
-      color: "#ffffff",
-      fontStyle: "bold",
-    });
-    this.add.image(20, 52, "heart_icon").setOrigin(0, 0.5);
-    this.livesText = this.add
-      .text(50, 52, "x1", {
-        fontSize: "18px",
-        color: "#ff3366",
-        fontStyle: "bold",
-      })
-      .setOrigin(0, 0.5);
-    this.add.image(110, 52, "lightning_icon").setOrigin(0, 0.5);
-    this.speedText = this.add
-      .text(140, 52, "x1.00", {
-        fontSize: "18px",
-        color: "#ffcc00",
-        fontStyle: "bold",
-      })
-      .setOrigin(0, 0.5);
-    this.statusText = this.add.text(20, 80, "", {
-      fontSize: "16px",
-      color: "#00ffff",
-      fontStyle: "bold",
-    });
+    // Весь статичный HUD собирается в одном месте
+    this.renderHUD();
 
-    this.createShieldIndicator();
+    // Восстановление прогресса из облака: станция/монеты (берём максимум
+    // локального и облачного) и сохранённый скин, если он открыт.
+    // Асинхронно и без блокировки — пока грузится, играем с локальным выбором.
+    void gameServices
+      .loadProgress()
+      .then((progress) => {
+        if (!this.scene.isActive()) return;
+
+        if (progress?.stationLevels) {
+          const local = GameState.getStation();
+          GameState.setStation({
+            engineering: Math.max(
+              local.engineering,
+              progress.stationLevels.engineering ?? 0,
+            ),
+            finance: Math.max(local.finance, progress.stationLevels.finance ?? 0),
+            design: Math.max(local.design, progress.stationLevels.design ?? 0),
+          });
+        }
+        if (
+          typeof progress?.coins === "number" &&
+          progress.coins > GameState.getCoins()
+        ) {
+          GameState.addCoins(progress.coins - GameState.getCoins());
+        }
+
+        if (!progress?.selectedSkin) return;
+        const savedSkin = getSkinById(progress.selectedSkin);
+        // Скин из облака применяем только если Design Wing его открывает
+        if (savedSkin.id !== this.currentSkin.id && isSkinUnlocked(savedSkin)) {
+          this.applySkin(savedSkin);
+        }
+      })
+      .catch(() => {
+        /* облако недоступно — играем с локальным скином */
+      });
 
     // Управление
     this.input.on("pointerdown", (pointer: Phaser.Input.Pointer) => {
       if (this.isGameOver) {
-        // На Game Over фиксируем стартовую точку тапа/свайпа для карусели
-        this.gameOverSwipeStartX = pointer.x;
-        this.gameOverSwipeActive = true;
         return;
       }
       this.resumeAudio();
+      if (this.isPaused) return;
       this.isDragging = true;
       this.dragStartX = pointer.x;
       this.playerStartX = this.playerContainer.x;
+      // Запоминаем стартовую точку и по вертикали — для драга вверх/вниз
+      this.dragStartY = pointer.y;
+      this.playerStartY = this.playerContainer.y;
 
       if (!this.isInvulnerable) {
         this.drawPlayerBorder(this.COLOR_BORDER_ACTIVE);
@@ -272,7 +348,7 @@ create() {
     });
 
     this.input.on("pointermove", (pointer: Phaser.Input.Pointer) => {
-      if (this.isGameOver) return;
+      if (this.isGameOver || this.isPaused) return;
       if (this.isDragging) {
         const deltaX = pointer.x - this.dragStartX;
         const targetX = this.playerStartX + deltaX;
@@ -283,17 +359,23 @@ create() {
           this.scale.width - halfWidth,
         );
 
+        // Вертикальный драг: вверх не выше середины экрана, вниз — до нижней границы
+        const deltaY = pointer.y - this.dragStartY;
+        const targetY = this.playerStartY + deltaY;
+        const clampedY = Phaser.Math.Clamp(
+          targetY,
+          this.scale.height / 2,
+          this.scale.height - halfWidth,
+        );
+
         this.playerContainer.x = clampedX;
+        this.playerContainer.y = clampedY;
         this.playerBody.updateFromGameObject();
       }
     });
 
-    this.input.on("pointerup", (pointer: Phaser.Input.Pointer) => {
+    this.input.on("pointerup", (_pointer: Phaser.Input.Pointer) => {
       if (this.isGameOver) {
-        if (this.gameOverSwipeActive) {
-          this.handleGameOverSwipe(pointer.x, pointer.y);
-        }
-        this.gameOverSwipeActive = false;
         return;
       }
       this.isDragging = false;
@@ -302,10 +384,11 @@ create() {
       }
     });
 
-    // Переключение скинов (1/2/3)
+    // Переключение скинов (цифры): заблокированные Design Wing — игнор
     if (this.input.keyboard) {
       SPACESHIP_SKINS.forEach((skin, index) => {
         this.input.keyboard!.on(`keydown-${index + 1}`, () => {
+          if (!isSkinUnlocked(skin)) return;
           this.applySkin(skin);
         });
       });
@@ -318,6 +401,9 @@ create() {
       callbackScope: this,
       loop: true,
     });
+
+    // Пассивный ремонт корабля от инженерного отсека станции
+    this.setupLifeRegen();
 
     // Оверлапы
     this.physics.add.overlap(
@@ -336,13 +422,20 @@ create() {
     );
     this.physics.add.overlap(
       this.playerContainer,
+      this.bombsGroup,
+      this.collectBomb,
+      undefined,
+      this,
+    );
+    this.physics.add.overlap(
+      this.playerContainer,
       this.gateTriggers,
       this.passGate,
       undefined,
       this,
     );
 
-    this.updateUI();
+    this.updateHUD();
 }
 
   // --- 🖌️ ОТРИСОВКА КРУГЛОЙ РАМКИ / ПОЛНОГО ЩИТА ---
@@ -382,58 +475,363 @@ create() {
     }
   }
 
-  // --- 🛡️ НЕОНОВЫЙ ИНДИКАТОР ЩИТА (по центру сверху) ---
-  private createShieldIndicator() {
-    const radius = 36;
-    const pointyTop = 90;
-    const pts: Phaser.Math.Vector2[] = [];
-    for (let i = 0; i < 6; i++) {
-      const a = ((pointyTop - i * 60) * Math.PI) / 180;
-      pts.push(new Phaser.Math.Vector2(radius * Math.cos(a), -radius * Math.sin(a)));
+  // --- 🛡️ ДВОЙНАЯ ДУГА ЩИТА ПЕРЕД НОСОМ КОРАБЛЯ ---
+  private drawShieldArcs(alpha: number) {
+    this.shieldArcs.clear();
+
+    const s = this.playerSize + this.borderPadding * 2;
+    const cx = 0;
+    const cy = -s * 0.32; // заметно впереди носа, не прилипает к кораблю
+    const color = this.COLOR_BORDER_SHIELD;
+
+    // Внешняя дуга: широкое неоновое гало + яркое ядро
+    const outerR = s * 0.6;
+    for (const [width, a] of [
+      [7, 0.25],
+      [2.5, 0.95],
+    ] as const) {
+      this.shieldArcs.lineStyle(width, color, a * alpha);
+      this.shieldArcs.beginPath();
+      this.shieldArcs.arc(
+        cx,
+        cy,
+        outerR,
+        Phaser.Math.DegToRad(-155),
+        Phaser.Math.DegToRad(-25),
+      );
+      this.shieldArcs.strokePath();
     }
 
-    const shieldGraphic = this.add.graphics();
-    shieldGraphic.fillStyle(this.COLOR_BORDER_SHIELD, 0.18);
-    shieldGraphic.fillPoints(pts, true);
-    shieldGraphic.lineStyle(3, this.COLOR_BORDER_SHIELD, 0.15);
-    shieldGraphic.strokePoints(pts, true, true);
-    shieldGraphic.lineStyle(1.5, this.COLOR_BORDER_SHIELD, 0.95);
-    shieldGraphic.strokePoints(pts, true, true);
+    // Внутренняя дуга (короче и тоньше)
+    const innerR = s * 0.44;
+    for (const [width, a] of [
+      [5, 0.2],
+      [1.8, 0.8],
+    ] as const) {
+      this.shieldArcs.lineStyle(width, color, a * alpha);
+      this.shieldArcs.beginPath();
+      this.shieldArcs.arc(
+        cx,
+        cy,
+        innerR,
+        Phaser.Math.DegToRad(-135),
+        Phaser.Math.DegToRad(-45),
+      );
+      this.shieldArcs.strokePath();
+    }
+  }
 
-    const label = this.add
-      .text(0, 0, "SHIELD", {
-        fontSize: "15px",
-        color: "#00ff88",
+  private hideShieldArcs() {
+    if (this.shieldArcs) {
+      this.shieldArcs.setVisible(false).clear();
+    }
+  }
+
+  // --- 🎬 renderHUD: сборка всего статичного HUD ---
+  // Верхняя зона между левым статусом и кнопкой паузы остаётся
+  // полностью чистой для пролетающих блоков и предупреждений.
+  private renderHUD(): void {
+    const w = this.scale.width;
+
+    // Левый верхний угол: статусы в ОДНУ ровную линию [♥ x5] [⚡ x1.44]
+    // Иконки рисуются вокруг своего origin, тексты — origin(0, 0.5),
+    // у всех общая ось Y = 20 — одинаковый вертикальный офсет.
+    const livesIcon = this.add.graphics();
+    this.drawHeartGlyph(livesIcon, 0xff3366);
+    livesIcon.setPosition(16, 20);
+    this.livesText = this.add
+      .text(28, 20, "x1", {
+        fontSize: "14px",
+        color: "#ffffff",
+        fontFamily: HUD_FONT,
         fontStyle: "bold",
       })
-      .setOrigin(0.5);
-    label.setShadow(0, 0, "#00ff88d2", 8, false, true);
+      .setOrigin(0, 0.5);
 
-    this.shieldIndicator = this.add
-      .container(this.scale.width / 2, 80, [shieldGraphic, label])
+    const boltIcon = this.add.graphics();
+    drawSciFiIcon(boltIcon, "engineering", 0xffcc00, 7);
+    boltIcon.setPosition(76, 20);
+    this.speedText = this.add
+      .text(88, 20, "x1.00", {
+        fontSize: "14px",
+        color: "#ffd700",
+        fontFamily: HUD_FONT,
+        fontStyle: "bold",
+      })
+      .setOrigin(0, 0.5);
+
+    // Правый угол: пауза в углу, активные бусты — СТРОГО столбиком под ней
+    this.createPauseButton();
+    this.x2Hud = this.createBoostHud(
+      this.COLOR_BORDER_BOOST,
+      (g) => drawSciFiIcon(g, "engineering", this.COLOR_BORDER_BOOST, 7),
+    );
+    this.shieldHud = this.createBoostHud(
+      this.COLOR_BORDER_SHIELD,
+      (g) => this.drawShieldGlyph(g, this.COLOR_BORDER_SHIELD),
+    );
+
+    // Уровень — лаконичная плашка с прогрессом до следующего
+    // умножения скорости в самом низу экрана
+    this.createLevelBar();
+
+    this.layoutHud(w, this.scale.height);
+
+    // HUD привязан к краям экрана — пересчитываем при ресайзе
+    const onHudResize = (size: Phaser.Structs.Size) =>
+      this.layoutHud(size.width, size.height);
+    this.scale.on("resize", onHudResize);
+    this.events.once("shutdown", () => {
+      this.scale.off("resize", onHudResize);
+    });
+  }
+
+  // --- ⏸ КРУГЛАЯ КНОПКА ПАУЗЫ (32×32, правый верхний угол) ---
+  private createPauseButton(): void {
+    const plate = this.add.graphics();
+    plate.fillStyle(0x12122a, 0.85);
+    plate.fillCircle(0, 0, 16);
+    plate.lineStyle(1.5, 0x00f0ff, 0.7);
+    plate.strokeCircle(0, 0, 16);
+
+    this.pauseGlyph = this.add.graphics();
+
+    this.pauseBtn = this.add.container(0, 0, [plate, this.pauseGlyph]);
+
+    // Явная круглая хит-зона — надёжный клик по всей кнопке
+    this.pauseBtn.setInteractive(
+      new Phaser.Geom.Circle(0, 0, 18),
+      Phaser.Geom.Circle.Contains,
+    );
+    this.pauseBtn.input!.cursor = "pointer"; // useHandCursor
+
+    this.pauseBtn.on("pointerup", () => this.togglePause());
+    this.drawPauseGlyph();
+  }
+
+  // --- SDK-шов управления паузой ---
+  // Внешние SDK (реклама, оверлеи магазинов) дергают публичные методы
+  // pauseGame/resumeGame и подписываются на setOnPauseChanged — UI-кнопка
+  // использует тот же механизм, поэтому поведение всегда синхронно.
+
+  public pauseGame(): void {
+    this.applyPaused(true);
+  }
+
+  public resumeGame(): void {
+    this.applyPaused(false);
+  }
+
+  public togglePause(): void {
+    this.applyPaused(!this.isPaused);
+  }
+
+  public setOnPauseChanged(cb: ((paused: boolean) => void) | undefined): void {
+    this.onPauseChanged = cb;
+  }
+
+  private applyPaused(paused: boolean): void {
+    if (this.isGameOver || this.isPaused === paused) return;
+    this.isPaused = paused;
+
+    if (paused) {
+      this.physics.world.pause();
+      this.time.paused = true; // спавн волн, реген, таймеры бустов
+      this.tweens.pauseAll(); // предупреждения и прочие анимации
+    } else {
+      this.physics.world.resume();
+      this.time.paused = false;
+      this.tweens.resumeAll();
+    }
+    this.drawPauseGlyph();
+    this.onPauseChanged?.(paused);
+  }
+
+  /** Иконка кнопки: две планки на паузе, треугольник — продолжить */
+  private drawPauseGlyph(): void {
+    const g = this.pauseGlyph;
+    g.clear();
+    g.fillStyle(0xffffff, 0.95);
+    if (this.isPaused) {
+      g.fillTriangle(-4, -6, -4, 6, 6, 0);
+    } else {
+      g.fillRect(-5, -6, 3.4, 12);
+      g.fillRect(1.6, -6, 3.4, 12);
+    }
+  }
+
+  // --- ВЕКТОРНЫЕ ГЛИФЫ HUD ---
+
+  /** Сердечко для счётчика жизней */
+  private drawHeartGlyph(g: Phaser.GameObjects.Graphics, color: number): void {
+    g.fillStyle(color, 0.95);
+    g.fillCircle(-2.7, -1.8, 3);
+    g.fillCircle(2.7, -1.8, 3);
+    g.fillPoints(
+      [
+        new Phaser.Math.Vector2(-5.2, -0.2),
+        new Phaser.Math.Vector2(5.2, -0.2),
+        new Phaser.Math.Vector2(0, 5.8),
+      ],
+      true,
+    );
+  }
+
+  /** Щит для плашки неуязвимости */
+  private drawShieldGlyph(g: Phaser.GameObjects.Graphics, color: number): void {
+    g.lineStyle(1.8, color, 0.95);
+    g.beginPath();
+    g.moveTo(0, -7);
+    g.lineTo(6, -4);
+    g.lineTo(6, 2);
+    g.lineTo(0, 7);
+    g.lineTo(-6, 2);
+    g.lineTo(-6, -4);
+    g.closePath();
+    g.strokePath();
+  }
+
+  // --- ⏳ ПАНЕЛЬ АКТИВНОГО БУСТА: мини-иконка + прогресс-бар 4px ---
+  private createBoostHud(
+    color: number,
+    drawIcon: (g: Phaser.GameObjects.Graphics) => void,
+  ): BoostHud {
+    const bgG = this.add.graphics();
+    bgG.fillStyle(color, 0.15);
+    bgG.fillRoundedRect(-BUFF_W / 2, -BUFF_H / 2, BUFF_W, BUFF_H, 6);
+    bgG.lineStyle(1, color, 0.35);
+    bgG.strokeRoundedRect(-BUFF_W / 2, -BUFF_H / 2, BUFF_W, BUFF_H, 6);
+
+    // Трек прогресс-бара
+    bgG.fillStyle(0xffffff, 0.12);
+    bgG.fillRoundedRect(BAR_X, BAR_Y, BAR_W, BAR_H, 2);
+
+    const icon = this.add.graphics();
+    icon.setPosition(-BUFF_W / 2 + 4 + 6, 0); // 4px от левого края
+    drawIcon(icon);
+    icon.setScale(0.75);
+
+    const barFill = this.add.graphics();
+
+    // Плашка создаётся скрытой и позиционируется в layoutHud
+    const container = this.add
+      .container(0, 0, [bgG, barFill, icon])
       .setVisible(false);
+
+    return { container, barFill, barWidth: BAR_W, color };
+  }
+
+  private runBoostHud(hud: BoostHud, durationMs: number): void {
+    if (hud.tween) {
+      hud.tween.stop();
+      hud.tween.remove();
+    }
+    hud.container.setVisible(true).setAlpha(1);
+
+    hud.tween = this.tweens.addCounter({
+      from: 1,
+      to: 0,
+      duration: durationMs,
+      ease: "Linear",
+      onUpdate: (tween) => {
+        const p = tween.getValue() ?? 0;
+        hud.barFill.clear();
+        hud.barFill.fillStyle(hud.color, 0.95);
+        hud.barFill.fillRect(BAR_X, BAR_Y, hud.barWidth * p, BAR_H);
+      },
+      onComplete: () => {
+        hud.container.setVisible(false);
+      },
+    });
+  }
+
+  private hideBoostHud(hud: BoostHud): void {
+    if (hud.tween) {
+      hud.tween.stop();
+      hud.tween.remove();
+      hud.tween = undefined;
+    }
+    hud.barFill.clear();
+    hud.container.setVisible(false);
+  }
+
+  // --- 📊 УРОВЕНЬ: нижняя плашка с прогрессом зачистки волны ---
+  private createLevelBar(): void {
+    const w = 210;
+    const h = 20;
+
+    const bg = this.add.graphics();
+    bg.fillStyle(0x12122a, 0.8);
+    bg.fillRoundedRect(-w / 2, -h / 2, w, h, 10);
+    bg.lineStyle(1, 0x00f0ff, 0.25);
+    bg.strokeRoundedRect(-w / 2, -h / 2, w, h, 10);
+
+    // Трек прогресса до следующего умножения скорости
+    bg.fillStyle(0xffffff, 0.12);
+    bg.fillRoundedRect(-36, -3, 128, 6, 3);
+
+    this.levelText = this.add
+      .text(-98, 0, "LEVEL 0", {
+        fontSize: "11px",
+        color: "#ffd700",
+        fontFamily: HUD_FONT,
+        fontStyle: "bold",
+      })
+      .setOrigin(0, 0.5);
+
+    this.levelBarFill = this.add.graphics();
+
+    this.levelBarContainer = this.add.container(
+      this.scale.width / 2,
+      this.scale.height - 24,
+      [bg, this.levelText, this.levelBarFill],
+    );
+    this.levelBarContainer.setDepth(50);
+  }
+
+  /**
+   * Прогресс до следующего умножения скорости:
+   * сколько волн пройдено от предыдущего порога до следующего.
+   * После конца таблицы пороги продолжают расти геометрически,
+   * так что прогресс считается всегда.
+   */
+  private getNextLevelProgress(): number {
+    const table = this.speedThresholds;
+    if (this.speedLevel >= table.length) return 1;
+    const prev = this.speedLevel === 0 ? 0 : table[this.speedLevel - 1];
+    const next = table[this.speedLevel];
+    return Phaser.Math.Clamp((this.score - prev) / (next - prev), 0, 1);
+  }
+
+  /** Перепозиционирование HUD-элементов, привязанных к краям экрана */
+  private layoutHud(w: number, h: number): void {
+    this.pauseBtn.setPosition(w - 36, 20);
+    // Стек бустов строго под кнопкой паузы
+    this.x2Hud.container.setPosition(w + BUFF_STACK_X_OFFSET, BUFF_STACK_Y_START);
+    this.shieldHud.container.setPosition(
+      w + BUFF_STACK_X_OFFSET,
+      BUFF_STACK_Y_START + BUFF_STACK_STEP,
+    );
+    this.levelBarContainer.setPosition(w / 2, h - 24);
   }
 
   // --- 🛡️ АКТИВАЦИЯ ЩИТА С МЕРЦАНИЕМ ---
-  private activateInvulnerability(durationMs: number = 5000) {
+  // === БАЛАНС: длительность щита увеличена с 5с до 7с
+  private activateInvulnerability(durationMs: number = 7000) {
     if (this.shieldTimer) this.shieldTimer.destroy();
     if (this.shieldBlinkTween) this.shieldBlinkTween.stop();
 
     this.isInvulnerable = true;
     this.shieldAlpha = 1;
-    this.showStatus("🛡️ Shield!");
 
     this.drawPlayerBorder(this.COLOR_BORDER_SHIELD);
 
-    // Показываем индикатор с лёгким «всплытием»
-    this.shieldIndicator.setVisible(true).setAlpha(1).setScale(0.8);
-    if (this.shieldIndicatorTween) this.shieldIndicatorTween.stop();
-    this.shieldIndicatorTween = this.tweens.add({
-      targets: this.shieldIndicator,
-      scale: 1,
-      duration: 300,
-      ease: "back.out",
-    });
+    // Таймер щита в верхней панели
+    this.runBoostHud(this.shieldHud, durationMs);
+
+    // Показываем двойную дугу перед носом корабля
+    this.shieldArcs.setVisible(true);
+    this.drawShieldArcs(this.shieldAlpha);
 
     const blinkStartDelay = Math.max(0, durationMs - 3000);
 
@@ -449,9 +847,8 @@ create() {
         onUpdate: (tween) => {
           this.shieldAlpha = tween.getValue() ?? 1;
           this.drawPlayerBorder(this.COLOR_BORDER_SHIELD);
-          if (this.shieldIndicator) {
-            this.shieldIndicator.setAlpha(this.shieldAlpha);
-          }
+          // Дуги мерцают синхронно с рамкой
+          this.drawShieldArcs(this.shieldAlpha);
         },
       });
     });
@@ -461,9 +858,8 @@ create() {
       this.shieldAlpha = 1;
       if (this.shieldBlinkTween) this.shieldBlinkTween.stop();
 
-      this.shieldIndicator.setVisible(false).setAlpha(1).setScale(1);
-
-      this.showStatus("");
+      this.hideShieldArcs();
+      this.hideBoostHud(this.shieldHud);
 
       const restoreColor =
         this.scoreMultiplier > 1
@@ -509,33 +905,124 @@ create() {
     });
   }
 
-  private checkSpeedProgression() {
-    if (
-      this.speedLevel < this.speedThresholds.length &&
-      this.score >= this.speedThresholds[this.speedLevel]
-    ) {
-      this.speedLevel++;
-      this.currentSpeed =
-        this.baseSpeed * Math.pow(this.speedMultiplierStep, this.speedLevel);
+  // === БАЛАНС: пассивная регенерация жизни из инженерного отсека станции ===
+  // ур.1 — +1 жизнь каждые 20с, каждый следующий уровень на 3с быстрее,
+  // минимум 8с (значения дублируются в StationScene MODULES)
+  private setupLifeRegen(): void {
+    const level = GameState.getStation().engineering;
+    if (level <= 0) return;
 
+    const intervalMs = Math.max(8000, 20000 - (level - 1) * 3000);
+    this.time.addEvent({
+      delay: intervalMs,
+      callback: () => {
+        if (this.isGameOver) return;
+        if (this.lives < this.maxLives) {
+          this.lives += 1;
+          this.updateHUD();
+        }
+      },
+      loop: true,
+    });
+  }
+
+  private checkSpeedProgression() {
+    // Порог следующего уровня: пока идём по таблице — берём из неё,
+    // после её конца пороги продолжаются геометрически (+18% за уровень),
+    // чтобы уровни не застывали на поздней игре.
+    const nextThreshold = (): number => {
+      const table = this.speedThresholds;
+      if (this.speedLevel < table.length) return table[this.speedLevel];
+
+      let threshold = table[table.length - 1];
+      for (let i = table.length; i <= this.speedLevel; i++) {
+        threshold = Math.round(threshold * 1.18);
+      }
+      return threshold;
+    };
+
+    let leveledUp = false;
+    while (this.score >= nextThreshold()) {
+      this.speedLevel++;
+      // === БАЛАНС === линейная скорость вместо экспоненты
+      this.currentSpeed = this.baseSpeed * this.getCurrentSpeedMult();
+
+      // === БАЛАНС === агрессивнее уплотняем волны: −130мс за уровень,
+      // пол 700мс — на высоких уровнях стены идут почти сплошным потоком
       const newDelay = Math.max(
-        1000,
-        this.baseSpawnDelay / Math.pow(1.15, this.speedLevel),
+        700,
+        this.baseSpawnDelay - this.speedLevel * 130,
       );
       if (this.spawnTimer) {
         this.spawnTimer.timeScale = this.baseSpawnDelay / newDelay;
       }
-
-      this.isLevelUpWave = true;
-
-      const currentMultiplierStr = Math.pow(
-        this.speedMultiplierStep,
-        this.speedLevel,
-      ).toFixed(2);
-      this.showStatus(`⚡ TURBO! (${currentMultiplierStr}x)`);
-      this.cameras.main.flash(250, 0, 243, 255);
-      this.cameras.main.shake(150, 0.005);
+      leveledUp = true;
     }
+
+    // === БАЛАНС: сигнал повышения уровня — только блинк экрана
+    if (leveledUp) {
+      this.cameras.main.flash(250, 0, 243, 255);
+    }
+
+    // Blind Mode: при первом пересечении множителем x8 включаем режим
+    if (this.getPreviewDelay() === 0 && !this.blindModeActive) {
+      this.activateBlindMode();
+    }
+  }
+
+  // --- 🔴 BLIND MODE: предупреждение + пульсирующая красная вигнетка ---
+  private activateBlindMode() {
+    this.blindModeActive = true;
+
+    const width = this.scale.width;
+    const height = this.scale.height;
+
+    // Разовое предупреждение по центру: плавно появляется и исчезает за ~1.5с
+    const warning = this.add
+      .text(width / 2, height * 0.42, "NO PREVIEW - REACTION MODE!", {
+        fontSize: "26px",
+        color: "#ff2244",
+        fontStyle: "bold",
+      })
+      .setOrigin(0.5)
+      .setDepth(95)
+      .setAlpha(0);
+    warning.setShadow(0, 0, "#ff2244", 16, false, true);
+
+    this.tweens.add({
+      targets: warning,
+      alpha: 1,
+      duration: 500,
+      ease: "Power2",
+      onComplete: () => {
+        this.tweens.add({
+          targets: warning,
+          alpha: 0,
+          delay: 500,
+          duration: 500,
+          onComplete: () => warning.destroy(),
+        });
+      },
+    });
+
+    // Постоянный пульсирующий красный глоу по краям экрана
+    const vignette = this.add.graphics().setDepth(90);
+    vignette.lineStyle(40, 0xff2244, 0.07);
+    vignette.strokeRect(-20, -20, width + 40, height + 40);
+    vignette.lineStyle(22, 0xff2244, 0.16);
+    vignette.strokeRect(-11, -11, width + 22, height + 22);
+    vignette.lineStyle(3, 0xff3344, 0.45);
+    vignette.strokeRect(1.5, 1.5, width - 3, height - 3);
+
+    this.blindVignette = vignette;
+    this.tweens.add({
+      targets: vignette,
+      alpha: { from: 0.35, to: 0.9 },
+      duration: 900,
+      yoyo: true,
+      repeat: -1,
+      ease: "sine.inout",
+    });
   }
 
   // Цвет препятствий зависит от текущего уровня скорости (интерполяция по палитре)
@@ -574,32 +1061,42 @@ create() {
   }
 
   // === БАЛАНС: длительность превью текущей волны ===
-  // До множителя x7 — стандартные 800мс, дальше плавно ужимается до минимума.
-  // На x7–x8 постоянный ряд подсказок позволял «абьюзить» тайминги и заранее
-  // вычитывать безопасную колонку — укорачиваем окно реакции по подсказке.
+  // До x5 — стандартные 800мс; x5→x6 — ужимается к 400мс;
+  // x6→x8 — 400мс → 150мс; с x8 — Blind Mode, превью = 0.
   private getPreviewDelay(): number {
-    const mult = Math.pow(this.speedMultiplierStep, this.speedLevel);
-    if (mult <= this.previewShrinkAtMultiplier) {
-      return this.basePreviewDelay;
-    }
-
-    const peakMult = Math.pow(
-      this.speedMultiplierStep,
-      this.speedThresholds.length,
-    );
-    // sqrt-сглаживание: сокращение ощутимо уже на x7–x8,
-    // а не только в самом конце прогрессии
-    const t = Math.sqrt(
-      Phaser.Math.Clamp(
-        (mult - this.previewShrinkAtMultiplier) /
-          (peakMult - this.previewShrinkAtMultiplier),
+    const mult = this.getCurrentSpeedMult();
+    if (mult <= this.blindModeMultiplier) {
+      if (mult <= this.previewFullUntilMultiplier) {
+        return this.basePreviewDelay;
+      }
+      if (mult <= this.previewFastAtMultiplier) {
+        // Ступень 1: x5 → x6, 800мс → 400мс
+        const t = Phaser.Math.Clamp(
+          (mult - this.previewFullUntilMultiplier) /
+            (this.previewFastAtMultiplier - this.previewFullUntilMultiplier),
+          0,
+          1,
+        );
+        return Math.round(
+          this.basePreviewDelay +
+            (this.previewMidDelay - this.basePreviewDelay) * t,
+        );
+      }
+      // Ступень 2: x6 → x8, 400мс → 150мс
+      const t = Phaser.Math.Clamp(
+        (mult - this.previewFastAtMultiplier) /
+          (this.blindModeMultiplier - this.previewFastAtMultiplier),
         0,
         1,
-      ),
-    );
-    return Math.round(
-      this.basePreviewDelay + (this.minPreviewDelay - this.basePreviewDelay) * t,
-    );
+      );
+      return Math.round(
+        this.previewMidDelay +
+          (this.minPreviewDelay - this.previewMidDelay) * t,
+      );
+    }
+
+    // Blind Mode: блоки спавнятся мгновенно, без превью-полосок
+    return 0;
   }
 
   // === БАЛАНС: компенсация укороченного превью ===
@@ -618,60 +1115,81 @@ create() {
     return -20 - cappedExtra;
   }
 
+  // === БАЛАНС: плотность волны зависит от уровня скорости ===
+  // Ранняя игра (эквивалент < x5 по старой шкале): 1–2 препятствия,
+  // середина (~x5–x8): 3, финал (x8+): 2–4 рандомно — стена с проходом,
+  // но непредсказуемой ширины
+  private getObstacleCount(): number {
+    if (this.speedLevel <= 4) {
+      return Phaser.Math.Between(1, 2);
+    }
+    if (this.speedLevel <= 7) {
+      return 3;
+    }
+    return Phaser.Math.Between(2, 4);
+  }
+
   private spawnWave() {
     const screenWidth = this.scale.width;
     const totalColumns = 5;
     const columnWidth = screenWidth / totalColumns;
 
-    const safeColumn = Phaser.Math.Between(0, totalColumns - 1);
     const fallVelocity = this.scale.height * this.currentSpeed;
 
     // === БАЛАНС: превью и стартовая позиция зависят от текущей скорости ===
     const previewDelay = this.getPreviewDelay();
     const spawnY = this.getSpawnY(fallVelocity, previewDelay);
 
-    // Палитра волны: при повышении уровня — бирюзовый/белый, в обычном режиме
-    // цвет зависит от текущей скорости (синий → жёлтый → красный)
-    const isLevelUp = this.isLevelUpWave;
-    const obstacleColor = isLevelUp ? 0x00f3ff : this.getSpeedColor();
-    const strokeColor = isLevelUp ? 0xffffff : this.lightenColor(obstacleColor, 0.45);
-    const safeColor = isLevelUp ? 0xffd700 : 0x00ff88;
+    // Цвет всегда от текущей скорости: смены палитры волны больше нет
+    const obstacleColor = this.getSpeedColor();
+    const strokeColor = this.lightenColor(obstacleColor, 0.45);
+    const safeColor = 0x00ff88;
 
-    if (isLevelUp) {
-      this.isLevelUpWave = false;
-    }
+    // === БАЛАНС: выбираем N колонок под препятствия, одну — под бонусный
+    // проход (невидимый триггер + мелодия), остальные остаются свободными.
+    // Превью у всех не-блочных колонок одинаковое — тонкий белый «прочерк»,
+    // чтобы игрок читал волну, а не искал подсвеченный проход
+    const allColumns = Phaser.Utils.Array.Shuffle([0, 1, 2, 3, 4]);
+    const obstacleCount = this.getObstacleCount();
+    const obstacleColumns = allColumns.slice(0, obstacleCount);
+    const safeColumn = allColumns[obstacleCount];
 
     for (let i = 0; i < totalColumns; i++) {
       const x = i * columnWidth + columnWidth / 2;
 
-      if (i === safeColumn) {
-        // Безопасный проход
-        const safeWarning = this.add.rectangle(
+      if (!obstacleColumns.includes(i)) {
+        // Нейтральная метка-проход (как у свободных колонок)
+        const marker = this.add.rectangle(
           x,
-          40,
-          columnWidth - 10,
-          15,
-          safeColor,
-          0.3,
+          44,
+          columnWidth - 26,
+          3,
+          0xffffff,
+          0.14,
         );
-        safeWarning.setStrokeStyle(1, safeColor, 0.8);
 
-        this.time.delayedCall(previewDelay, () => {
-          safeWarning.destroy();
+        if (i === safeColumn) {
+          this.time.delayedCall(previewDelay, () => {
+            marker.destroy();
 
-          const gateTrigger = this.add.rectangle(
-            x,
-            spawnY,
-            columnWidth - 10,
-            10,
-            safeColor,
-            0,
-          );
-          this.gateTriggers.add(gateTrigger);
+            const gateTrigger = this.add.rectangle(
+              x,
+              spawnY,
+              columnWidth - 10,
+              10,
+              safeColor,
+              0,
+            );
+            this.gateTriggers.add(gateTrigger);
 
-          const gateBody = gateTrigger.body as Phaser.Physics.Arcade.Body;
-          gateBody.setVelocityY(fallVelocity);
-        });
+            const gateBody = gateTrigger.body as Phaser.Physics.Arcade.Body;
+            gateBody.setVelocityY(fallVelocity);
+          });
+        } else {
+          this.time.delayedCall(previewDelay, () => {
+            marker.destroy();
+          });
+        }
         continue;
       }
 
@@ -707,31 +1225,44 @@ create() {
       });
     }
 
-    if (Phaser.Math.Between(1, 100) <= 35) {
+    // === БАЛАНС === шанс буста скручен до 22%
+    if (Phaser.Math.Between(1, 100) <= 22) {
       // Буст выезжает сразу после того, как превью волны отработало
       this.time.delayedCall(previewDelay + 300, () => {
-        this.spawnBetweenWaveBoost(totalColumns, columnWidth, fallVelocity);
+        this.spawnBetweenWaveBoost(totalColumns, columnWidth);
       });
     }
 
     this.score += 1 * this.scoreMultiplier;
     this.checkSpeedProgression();
-    this.updateUI();
+    this.updateHUD();
   }
 
-  private spawnBetweenWaveBoost(
-    totalColumns: number,
-    columnWidth: number,
-    fallVelocity: number,
-  ) {
+  private spawnBetweenWaveBoost(totalColumns: number, columnWidth: number) {
     const randomColumn = Phaser.Math.Between(0, totalColumns - 1);
     const x = randomColumn * columnWidth + columnWidth / 2;
 
-    const boostWarning = this.add.circle(x, 40, 10, 0xbb00ff, 0.4);
-    boostWarning.setStrokeStyle(1, 0xdd44ff, 0.8);
+    // === БАЛАНС === 15% коллектиблов — красная бомба-ловушка,
+    // остальные 85% — честные бусты (жизнь / x2 / щит)
+    const isBomb = Phaser.Math.Between(1, 100) <= this.bombChancePercent;
+    const warnFill = isBomb ? 0xff2244 : 0xbb00ff;
+    const warnStroke = isBomb ? 0xff6677 : 0xdd44ff;
+
+    // === БАЛАНС: фиксированная «вольная» скорость полёта бонуса —
+    // не привязана к скорости игры, чтобы бонус висел дольше
+    // и его можно было подобрать даже на высоких скоростях
+    const boostVelocity = this.scale.height * this.boostFallSpeed;
+
+    const collectibleWarning = this.add.circle(x, 40, 10, warnFill, 0.4);
+    collectibleWarning.setStrokeStyle(1, warnStroke, 0.8);
 
     this.time.delayedCall(600, () => {
-      boostWarning.destroy();
+      collectibleWarning.destroy();
+
+      if (isBomb) {
+        this.spawnBomb(x, boostVelocity);
+        return;
+      }
 
       const boostBlock = this.add.rectangle(x, -20, 30, 30, 0xbb00ff, 0.7);
       boostBlock.setStrokeStyle(2, 0xee77ff, 1);
@@ -739,7 +1270,7 @@ create() {
       this.boostsGroup.add(boostBlock);
 
       const boostBody = boostBlock.body as Phaser.Physics.Arcade.Body;
-      boostBody.setVelocityY(fallVelocity);
+      boostBody.setVelocityY(boostVelocity);
 
       this.tweens.add({
         targets: boostBlock,
@@ -748,6 +1279,62 @@ create() {
         repeat: -1,
       });
     });
+  }
+
+  // --- 💣 КРАСНАЯ БОМБА: единственный тип ловушки ---
+  private spawnBomb(x: number, fallVelocity: number) {
+    const bombGfx = this.add.graphics();
+    // Корпус
+    bombGfx.fillStyle(0xff2244, 0.92);
+    bombGfx.fillCircle(0, 0, 14);
+    bombGfx.lineStyle(2, 0xff8899, 1);
+    bombGfx.strokeCircle(0, 0, 14);
+    // Тёмный «крест»-детонатор
+    bombGfx.lineStyle(2.5, 0x550008, 0.95);
+    bombGfx.lineBetween(-8, 0, 8, 0);
+    bombGfx.lineBetween(0, -8, 0, 8);
+    // Блик
+    bombGfx.fillStyle(0xffffff, 0.85);
+    bombGfx.fillCircle(-5, -5, 3);
+
+    const bomb = this.add.container(x, -20, [bombGfx]);
+    this.physics.add.existing(bomb);
+    this.bombsGroup.add(bomb);
+
+    const bombBody = bomb.body as Phaser.Physics.Arcade.Body;
+    bombBody.setSize(28, 28);
+    bombBody.setOffset(-14, -14);
+    bombBody.setVelocityY(fallVelocity);
+
+    // Тревожная пульсация вместо вращения
+    this.tweens.add({
+      targets: bombGfx,
+      alpha: { from: 1, to: 0.55 },
+      scale: { from: 1, to: 1.12 },
+      duration: 320,
+      yoyo: true,
+      repeat: -1,
+      ease: "sine.inout",
+    });
+  }
+
+  private collectBomb(_player: any, bomb: any) {
+    this.tweens.killTweensOf(bomb);
+    bomb.destroy();
+
+    // Щит полностью блокирует урон — бомба детонирует впустую
+    if (!this.isInvulnerable) {
+      this.lives -= 1;
+      this.updateHUD();
+    }
+
+    // Красная вспышка + короткая тряска камеры в любом случае
+    this.cameras.main.flash(200, 255, 0, 0);
+    this.cameras.main.shake(150, 0.01);
+
+    if (this.lives <= 0) {
+      this.showGameOver();
+    }
   }
 
   private passGate(_player: any, trigger: any) {
@@ -763,29 +1350,35 @@ create() {
     const type = Phaser.Utils.Array.GetRandom([1, 2, 3]);
 
     if (type === 1) {
-      this.lives += 1;
-      this.showStatus("❤️ +1 Life!");
+      // Жизнь засчитывается только до лимита — на потолке бонус уходит в никуда
+      if (this.lives < this.maxLives) {
+        this.lives += 1;
+      }
     } else if (type === 2) {
       if (this.boostMultiplierTimer) this.boostMultiplierTimer.destroy();
 
       this.scoreMultiplier = 2;
-      this.showStatus("🔥 X2 Score!");
       this.updateBorderState(this.COLOR_BORDER_BOOST);
+      // === БАЛАНС === честные фиксированные 8 секунд, без урезания
+      this.runBoostHud(this.x2Hud, this.x2DurationMs);
 
-      this.boostMultiplierTimer = this.time.delayedCall(10000, () => {
-        this.scoreMultiplier = 1;
-        this.showStatus("");
-        this.updateBorderState(
-          this.isInvulnerable
-            ? this.COLOR_BORDER_SHIELD
-            : this.defaultBorderColor(),
-        );
-      });
+      this.boostMultiplierTimer = this.time.delayedCall(
+        this.x2DurationMs,
+        () => {
+          this.scoreMultiplier = 1;
+          this.hideBoostHud(this.x2Hud);
+          this.updateBorderState(
+            this.isInvulnerable
+              ? this.COLOR_BORDER_SHIELD
+              : this.defaultBorderColor(),
+          );
+        },
+      );
     } else if (type === 3) {
-      this.activateInvulnerability(5000);
+      this.activateInvulnerability(this.shieldDurationMs);
     }
 
-    this.updateUI();
+    this.updateHUD();
   }
 
   private initAudio() {
@@ -863,7 +1456,7 @@ create() {
 
     obstacle.destroy();
     this.lives -= 1;
-    this.updateUI();
+    this.updateHUD();
     this.cameras.main.flash(200, 255, 0, 0);
     this.cameras.main.shake(120, 0.008);
 
@@ -872,7 +1465,7 @@ create() {
     }
   }
 
-  // --- 🎮 ОКНО GAME OVER С НЕОНОВЫМ ОВЕРЛЕЕМ И КАРУСЕЛЬЮ СКИНОВ ---
+  // --- 🎮 МОДАЛЬНОЕ ОКНО GAME OVER (GameOverModal) ---
   private showGameOver() {
     if (this.isGameOver) return;
     this.isGameOver = true;
@@ -882,204 +1475,89 @@ create() {
     this.time.removeAllEvents();
     if (this.shieldBlinkTween) this.shieldBlinkTween.stop();
     this.isDragging = false;
-    this.shieldIndicator.setVisible(false);
+    this.hideShieldArcs();
+    this.hideBoostHud(this.x2Hud);
+    this.hideBoostHud(this.shieldHud);
 
     // Очищаем падающие объекты
     this.obstacles.clear(true, true);
     this.boostsGroup.clear(true, true);
+    this.bombsGroup.clear(true, true);
     this.gateTriggers.clear(true, true);
 
-    const width = this.scale.width;
-    const height = this.scale.height;
-
-    // Контейнер для всего UI окончания игры
-    const gameOverContainer = this.add.container(0, 0).setDepth(100);
-
-    // Полупрозрачный темный фон
-    const bg = this.add
-      .rectangle(width / 2, height / 2, width, height, 0x050510, 0.85);
-
-    // Текст GAME OVER
-    const title = this.add
-      .text(width / 2, height * 0.18, "GAME OVER", {
-        fontSize: "36px",
-        color: "#ff0055",
-        fontStyle: "bold",
-      })
-      .setOrigin(0.5);
-    title.setShadow(0, 0, "#ff0055", 12, false, true);
-
-    // Статистика
-    const currentMult = Math.pow(
-      this.speedMultiplierStep,
-      this.speedLevel,
-    ).toFixed(2);
-    const statsText = this.add
-      .text(
-        width / 2,
-        height * 0.32,
-        `SCORE: ${this.score}\nMAX SPEED: x${currentMult}`,
-        {
-          fontSize: "20px",
-          color: "#ffffff",
-          align: "center",
-          lineSpacing: 10,
-        },
-      )
-      .setOrigin(0.5);
-
-// --- ПРЕВЬЮ КОРАБЛЯ В КАРУСЕЛИ (живой через NeonShipRenderer) ---
-    const previewSize = Math.min(90, width * 0.14);
-    const previewFrame = this.add.graphics();
-    const previewShip = NeonShipRenderer.create(this, this.currentSkin, previewSize);
-    const previewContainer = this.add.container(width / 2, height * 0.46, [
-      previewFrame,
-      previewShip,
-    ]);
-
-    // Название корабля над превью
-    const skinLabel = this.add
-      .text(width / 2, height * 0.64, `SHIP: ${this.currentSkin.name}`, {
-        fontSize: "16px",
-        color: "#ffcc00",
-        fontStyle: "bold",
-      })
-      .setOrigin(0.5);
-
-    // Стрелки и подсказка (визуальные)
-    const prevBtn = this.add
-      .text(width / 2 - 110, height * 0.64, "◄", {
-        fontSize: "28px",
-        color: "#ffcc00",
-      })
-      .setOrigin(0.5);
-    const nextBtn = this.add
-      .text(width / 2 + 110, height * 0.64, "►", {
-        fontSize: "28px",
-        color: "#ffcc00",
-      })
-      .setOrigin(0.5);
-
-    const hintText = this.add
-      .text(width / 2, height * 0.72, "TAP / SWIPE ◄ ►", {
-        fontSize: "12px",
-        color: "#888899",
-      })
-      .setOrigin(0.5);
-
-    // Переключение скинов обрабатывается на уровне сцены
-    // (тап/свайп по экрану + стрелки клавиатуры), см. handleGameOverSwipe
-    this.gameOverCarousel = {
-      frame: previewFrame,
-      ship: previewShip,
-      label: skinLabel,
-      size: previewSize,
-    };
-    // Синхронизируем рамку/подпись с текущим скином
-    this.switchSkinBy(0);
-
-    // Клавиатура: стрелки листают скины
-    if (this.input.keyboard) {
-      this.input.keyboard.on("keydown-LEFT", () => this.switchSkinBy(-1));
-      this.input.keyboard.on("keydown-RIGHT", () => this.switchSkinBy(1));
+    // Статистика: текущий счёт рядом с рекордом из localStorage
+    const currentMult = this.getCurrentSpeedMult().toFixed(2);
+    const prevBest = loadHighscore();
+    const isNewRecord = this.score > prevBest;
+    if (isNewRecord) {
+      saveHighscore(this.score);
     }
+    const best = Math.max(prevBest, this.score);
 
-    // --- КНОПКА: RESTART ---
-    const restartBtnBg = this.add
-      .rectangle(width / 2, height * 0.8, 220, 52, 0x00f3ff, 0.2)
-      .setStrokeStyle(2, 0x00f3ff, 1)
-      .setInteractive({ useHandCursor: true });
-    const restartBtnText = this.add
-      .text(width / 2, height * 0.8, "RESTART", {
-        fontSize: "20px",
-        color: "#00f3ff",
-        fontStyle: "bold",
-      })
-      .setOrigin(0.5);
+    // === БАЛАНС === монеты за забег: счёт × множитель финансового
+    // отсека станции (+10% за уровень)
+    const station = GameState.getStation();
+    const coinMult = 1 + station.finance * 0.1;
+    const earnedCoins = Math.max(1, Math.round(this.score * coinMult));
+    GameState.addCoins(earnedCoins);
 
-    restartBtnBg.on("pointerdown", () => {
-      this.scene.restart();
+    // Облачная синхронизация (Firebase через адаптер): рекорд в лидерборд
+    // с ником игрока из настроек и текущий прогресс (включая станцию).
+    // Fire-and-forget — не блокирует отрисовку UI, а менеджер сам
+    // глотает сетевые ошибки.
+    void gameServices.submitScore(this.score, GameState.getUsername());
+    void gameServices.saveProgress({
+      achievements: [],
+      selectedShip: this.currentSkin.id,
+      selectedSkin: this.currentSkin.id,
+      stationLevels: station,
+      coins: GameState.getCoins(),
     });
 
-    gameOverContainer.add([
-      bg,
-      title,
-      statsText,
-      previewContainer,
-      skinLabel,
-      prevBtn,
-      nextBtn,
-      hintText,
-      restartBtnBg,
-      restartBtnText,
-]);
-
-    // Плавное появление UI
-    gameOverContainer.setAlpha(0);
-    this.tweens.add({
-      targets: gameOverContainer,
-      alpha: 1,
-      duration: 400,
-      ease: "Power2",
-    });
-  }
-
-  /**
-   * Листает скины в карусели на Game Over.
-   * direction: -1 — назад, 1 — вперёд, 0 — только перерисовать текущий.
-   */
-  private switchSkinBy(direction: number): void {
-    const carousel = this.gameOverCarousel;
-    if (!carousel) return;
-
-    const currentIndex = SPACESHIP_SKINS.findIndex(
-      (s) => s.id === this.currentSkin.id,
+    this.gameOverModal = new GameOverModal(
+      this,
+      {
+        score: this.score,
+        best,
+        isNewRecord,
+        maxSpeedMult: `x${currentMult}`,
+        coins: earnedCoins,
+      },
+      {
+        onDoubleCoins: () => this.doubleRunCoins(earnedCoins),
+        onRestart: () => this.scene.restart(),
+        onMenu: () => this.scene.start("MainMenu"),
+      },
     );
-    let newIndex = (currentIndex + direction) % SPACESHIP_SKINS.length;
-    if (newIndex < 0) newIndex = SPACESHIP_SKINS.length - 1;
-
-    const newSkin = SPACESHIP_SKINS[newIndex];
-    this.applySkin(newSkin);
-
-    NeonShipRenderer.updateSkin(carousel.ship, newSkin, carousel.size);
-    const s = carousel.size + 18;
-    carousel.frame.clear();
-    carousel.frame.lineStyle(2, newSkin.glowColor, 0.9);
-    carousel.frame.strokeRoundedRect(-s / 2, -s / 2, s, s, 14);
-    carousel.label.setText(`SHIP: ${newSkin.name}`);
   }
 
-  /**
-   * Обработка тапа/свайпа по экрану Game Over:
-   * свайп влево/вправо или тап в соответствующей половине листает карусель.
-   */
-  private handleGameOverSwipe(endX: number, endY: number): void {
-    // Не реагируем на зону кнопки RESTART
-    if (endY > this.scale.height * 0.76) return;
+  /** Удвоение награды за просмотр рекламы: начисляем вторую половину */
+  private doubleRunCoins(baseCoins: number) {
+    GameState.addCoins(baseCoins);
+    this.gameOverModal?.markCoinsDoubled();
 
-    const dx = endX - this.gameOverSwipeStartX;
-    if (Math.abs(dx) >= 50) {
-      // Свайп
-      this.switchSkinBy(dx < 0 ? 1 : -1);
-    } else if (Math.abs(dx) < 12) {
-      // Тап: левая половина — назад, правая — вперёд
-      this.switchSkinBy(endX < this.scale.width / 2 ? -1 : 1);
-    }
-    // Промежуточные движения игнорируем
+    // Повторная облачная синхронизация с удвоенной суммой
+    void gameServices.saveProgress({
+      achievements: [],
+      selectedShip: this.currentSkin.id,
+      selectedSkin: this.currentSkin.id,
+      stationLevels: GameState.getStation(),
+      coins: GameState.getCoins(),
+    });
   }
 
-  private updateUI() {
-    this.scoreText.setText(`Level: ${this.score}`);
+  private updateHUD() {
     this.livesText.setText(`x${this.lives}`);
 
-    const currentMult = Math.pow(
-      this.speedMultiplierStep,
-      this.speedLevel,
-    ).toFixed(2);
+    const currentMult = this.getCurrentSpeedMult().toFixed(2);
     this.speedText.setText(`x${currentMult}`);
-  }
 
-  private showStatus(msg: string) {
-    this.statusText.setText(msg);
+    // Нижняя плашка: номер уровня = количество умножений скорости,
+    // бар — прогресс до следующего умножения
+    this.levelText.setText(`LEVEL ${this.speedLevel}`);
+    const p = this.getNextLevelProgress();
+    this.levelBarFill.clear();
+    this.levelBarFill.fillStyle(this.getSpeedColor(), 0.95);
+    this.levelBarFill.fillRect(-36, -3, 128 * p, 6);
   }
 }

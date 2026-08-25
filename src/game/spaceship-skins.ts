@@ -28,6 +28,8 @@ export interface SpaceshipSkin {
   glowColor: number;
   gapSize: number;
   parts: GeoPart[];
+  /** Минимальный уровень конструкторского отсека станции (0/undefined — открыт сразу) */
+  requiredDesignLevel?: number;
 }
 
 export const SPACESHIP_SKINS: SpaceshipSkin[] = [
@@ -428,6 +430,65 @@ export const SPACESHIP_SKINS: SpaceshipSkin[] = [
 export function getSkinById(id: string): SpaceshipSkin {
   return SPACESHIP_SKINS.find((skin) => skin.id === id) ?? SPACESHIP_SKINS[0];
 }
+
+/**
+ * Скины, доступные при данном уровне конструкторского отсека станции.
+ * Базовые корабли (без requiredDesignLevel) открыты всегда.
+ */
+export function getUnlockedSkins(designLevel: number): SpaceshipSkin[] {
+  return SPACESHIP_SKINS.filter(
+    (skin) => (skin.requiredDesignLevel ?? 0) <= designLevel,
+  );
+}
+
+// ============================================================
+// Скины-награды конструкторского отсека: геометрия базовых
+// кораблей + новая неоновая окраска. Добавляются в конец каталога,
+// поэтому карусель листает их после базовых.
+// ============================================================
+function cloneWithColors(
+  base: SpaceshipSkin,
+  patch: Pick<
+    SpaceshipSkin,
+    "id" | "name" | "requiredDesignLevel" | "primaryColor" | "accentColor" | "glowColor"
+  >,
+): SpaceshipSkin {
+  return {
+    ...base,
+    ...patch,
+    price: 0,
+    unlocked: true,
+    gapSize: base.gapSize,
+    parts: base.parts.map((p) => ({ ...p })),
+  };
+}
+
+SPACESHIP_SKINS.push(
+  cloneWithColors(SPACESHIP_SKINS[0], {
+    id: "phantom",
+    name: "Phantom",
+    requiredDesignLevel: 1,
+    primaryColor: 0x9d00ff, // фиолетовый неон
+    accentColor: 0xe0b3ff,
+    glowColor: 0xb44dff,
+  }),
+  cloneWithColors(SPACESHIP_SKINS[1], {
+    id: "viper",
+    name: "Viper",
+    requiredDesignLevel: 2,
+    primaryColor: 0x00ff88, // кислотно-зелёный неон
+    accentColor: 0xb3ffd9,
+    glowColor: 0x00ff9d,
+  }),
+  cloneWithColors(SPACESHIP_SKINS[2], {
+    id: "titan",
+    name: "Titan",
+    requiredDesignLevel: 3,
+    primaryColor: 0xff2222, // алый неон
+    accentColor: 0xffb3b3,
+    glowColor: 0xff4444,
+  }),
+);
 
 // Выбранный скин хранится на уровне модуля, чтобы переживать перезапуск сцены
 let selectedSkinId: string = "scout";
