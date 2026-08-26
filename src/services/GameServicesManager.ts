@@ -93,6 +93,40 @@ export class GameServicesManager {
       return null;
     }
   }
+
+  async unlockModel(modelId: string, priceCR: number): Promise<boolean> {
+    try {
+      return await this.adapter.unlockModel(modelId, priceCR);
+    } catch (e) {
+      console.warn("[GameServices] unlockModel failed:", e);
+      return false;
+    }
+  }
+
+  async unlockPalette(paletteId: string, priceBP: number): Promise<boolean> {
+    try {
+      return await this.adapter.unlockPalette(paletteId, priceBP);
+    } catch (e) {
+      console.warn("[GameServices] unlockPalette failed:", e);
+      return false;
+    }
+  }
+
+  async equipCustomization(modelId: string, paletteId: string): Promise<void> {
+    try {
+      await this.adapter.equipCustomization(modelId, paletteId);
+    } catch (e) {
+      console.warn("[GameServices] equipCustomization failed:", e);
+    }
+  }
+
+  async updateBlueprintsToCloud(blueprints: number, lastBpTimestamp: number): Promise<void> {
+    try {
+      await this.adapter.updateBlueprintsToCloud(blueprints, lastBpTimestamp);
+    } catch (e) {
+      console.warn("[GameServices] updateBlueprintsToCloud failed:", e);
+    }
+  }
 }
 
 /** Синглтон: игра импортирует только его */

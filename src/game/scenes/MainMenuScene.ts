@@ -19,6 +19,7 @@ import {
 } from "../ui/NeonUI";
 import { gameServices } from "../../services/GameServicesManager";
 import { CoinPlate } from "../ui/CoinPlate";
+import { PALETTES, loadCustomization } from "../garage-data";
 
 export class MainMenuScene extends Phaser.Scene {
   private gridGraphics!: Phaser.GameObjects.Graphics;
@@ -26,6 +27,7 @@ export class MainMenuScene extends Phaser.Scene {
   private adsPlate!: Phaser.GameObjects.Container;
   private livesPlate!: Phaser.GameObjects.Container;
   private livesText!: Phaser.GameObjects.Text;
+  private rankPlate!: Phaser.GameObjects.Container;
   private rankText!: Phaser.GameObjects.Text;
   private settingsBtn!: Phaser.GameObjects.Container;
 
@@ -53,6 +55,13 @@ export class MainMenuScene extends Phaser.Scene {
   create(): void {
     this.cameras.main.setBackgroundColor(COLOR_BG);
     this.cameras.main.fadeIn(400, 0, 0, 0);
+
+    // Синхронизируем BP при входе в меню (Design Wing генерирует пассивно)
+    GameState.syncBlueprints();
+    void gameServices.updateBlueprintsToCloud(
+      GameState.getBlueprints(),
+      GameState.getLastBpTimestamp(),
+    );
 
     this.gridGraphics = this.add.graphics().setDepth(0);
     
@@ -128,17 +137,25 @@ export class MainMenuScene extends Phaser.Scene {
     this.livesPlate = this.add.container(0, 0, [livesBg, livesIcon, this.livesText]);
     this.updateLivesDisplay();
 
-    // Позиция игрока в топе (фиолетовый неон) — под плашкой энергии
+    // Позиция игрока в топе — плашка с фиолетовым фоном под жизнями
+    const rankW = 100;
+    const rankH = 22;
+    const rankBg = this.add.graphics();
+    rankBg.fillStyle(0x12002a, 0.7);
+    rankBg.fillRoundedRect(-rankW / 2, -rankH / 2, rankW, rankH, 6);
+    rankBg.lineStyle(1.4, COLOR_PURPLE, 0.75);
+    rankBg.strokeRoundedRect(-rankW / 2, -rankH / 2, rankW, rankH, 6);
+
     this.rankText = this.add
       .text(0, 0, "", {
         fontSize: "11px",
         color: "#9d00ff",
         fontStyle: "bold",
-        stroke: "#9d00ff",
-        strokeThickness: 0.5,
       })
-      .setOrigin(0.5, 0)
-      .setAlpha(0);
+      .setOrigin(0.5);
+
+    this.rankPlate = this.add.container(0, 0, [rankBg, this.rankText]);
+    this.rankPlate.setAlpha(0);
 
     this.fetchAndShowRank();
 
@@ -178,10 +195,10 @@ export class MainMenuScene extends Phaser.Scene {
 
       // Мягкое появление через 1с (когда данные точно загружены)
       this.time.delayedCall(1000, () => {
-        if (!this.rankText) return;
-        this.rankText.setAlpha(1);
+        if (!this.rankPlate) return;
+        this.rankPlate.setAlpha(1);
         this.tweens.add({
-          targets: this.rankText,
+          targets: this.rankPlate,
           alpha: { from: 0.6, to: 1 },
           duration: 1800,
           yoyo: true,
@@ -196,7 +213,16 @@ export class MainMenuScene extends Phaser.Scene {
 
   // --- Центральный блок с акцентом (Hero Section) ---
  private createHeroSection(): void {
-  const skin = getSelectedSkin();
+  const baseSkin = getSelectedSkin();
+  // === БАЛАНС: применяем выбранную палитру к hull геометрии ===
+  const custom = loadCustomization();
+  const palette = PALETTES.find((p) => p.id === custom.selectedPaletteId) ?? PALETTES[0];
+  const skin = {
+    ...baseSkin,
+    primaryColor: palette.primary,
+    accentColor: palette.accent,
+    glowColor: palette.glow,
+  };
 
   // 1. Неоновая фоновая орбита (создает эффект кибер-платформы под кораблем)
   const orbitGraphics = this.add.graphics();
@@ -548,12 +574,17 @@ export class MainMenuScene extends Phaser.Scene {
     this.drawGrid(w, h);
 
     const pad = 16;
-    // Top Bar с safety margin +16px от верхнего края:
-    // монеты слева (жизни под ними), реклама справа
+    // Левый край всех элементов: pad + 5 = 21px
+    const leftX = pad + 5;
+    // Top Bar: монеты сверху, жизни под ними, ранг под жизнями
     const topBarY = pad + 20 + 16; // pad + 36
-    this.coinPlate.setPosition(pad + 56, topBarY);
-    this.livesPlate.setPosition(pad + 68, topBarY + 38);
-    this.rankText.setPosition(pad + 68, topBarY + 38 + 20);
+
+    // CoinPlate: ширина 130, контейнер в центре → сдвиг вправо на halfW
+    this.coinPlate.setPosition(leftX + 65, topBarY);
+    // LivesPlate: ширина 136
+    this.livesPlate.setPosition(leftX + 68, topBarY + 38);
+    // RankPlate: центрируем под livesPlate (x = leftX + 68)
+    this.rankPlate.setPosition(leftX + 68, topBarY + 38 + 22);
     this.adsPlate.setPosition(w - pad - 56, topBarY);
 
     // SETTINGS — под кнопкой "+50 COINS" с зазором 12px
@@ -583,7 +614,10 @@ export class MainMenuScene extends Phaser.Scene {
   }
 
   private onSkinsClick(): void {
-    this.showToast("SKINS SHOP", COLOR_PINK);
+    this.cameras.main.fadeOut(300, 0, 0, 0);
+    this.cameras.main.once("camerafadeoutcomplete", () => {
+      this.scene.start("Garage");
+    });
   }
 
   private goToScene(key: string): void {

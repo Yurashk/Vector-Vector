@@ -10,6 +10,8 @@ import {
   SPACESHIP_SKINS,
   SpaceshipSkin,
 } from "../spaceship-skins";
+import { PALETTES } from "../garage-data";
+import { loadCustomization } from "../garage-data";
 
 // --- Рекорд в localStorage ---
 const HIGHSCORE_KEY = "dodge-runner-highscore";
@@ -69,8 +71,18 @@ export class Game extends Phaser.Scene {
   private playerBorder!: Phaser.GameObjects.Graphics;
   private playerBody!: Phaser.Physics.Arcade.Body;
 
-  // Выбранный скин
-  private currentSkin: SpaceshipSkin = getSelectedSkin();
+  // Выбранный скин + палитра (применяем palette цвета к hull геометрии)
+  private currentSkin: SpaceshipSkin = (() => {
+    const base = getSelectedSkin();
+    const custom = loadCustomization();
+    const palette = PALETTES.find((p) => p.id === custom.selectedPaletteId) ?? PALETTES[0];
+    return {
+      ...base,
+      primaryColor: palette.primary,
+      accentColor: palette.accent,
+      glowColor: palette.glow,
+    };
+  })();
 
   private isGameOver: boolean = false;
 
@@ -114,13 +126,15 @@ export class Game extends Phaser.Scene {
   // Прогрессия скорости
   private baseSpeed: number = 0.35;
   private currentSpeed: number = 0.35;
-  // === БАЛАНС === двухступенчатый рост скорости: до множителя x5 —
-  // быстрые +25% за уровень, дальше плавнее +16%; лимита нет
+  // === БАЛАНС === двухступенчатый рост скорости:
+  // До x3.5 (уровни 0–10): +25% за уровень
+  // После x3.5 (уровни 11+): +8% за уровень — мягкий рост без потолка
   private readonly fastSpeedStepPerLevel: number = 0.25;
-  private readonly normalSpeedStepPerLevel: number = 0.16;
-  private readonly fastSpeedCapMultiplier: number = 5;
-  // === БАЛАНС: бонусы падают с фиксированной «вольной» скоростью,
-  // не зависящей от уровня игры, чтобы их можно было поймать на любой скорости
+  private readonly postChaosSpeedStep: number = 0.08;
+  private readonly chaosPhaseLevel: number = 10;
+  private readonly chaosPhaseMultiplier: number = 3.5;
+  // === БАЛАНС: бонусы падают с фиксированной скоростью,
+  // не зависящей от уровня игры
   private boostFallSpeed: number = 0.3;
   // === БАЛАНС === честные фиксированные длительности бустов
   private readonly shieldDurationMs: number = 7000;
@@ -138,29 +152,24 @@ export class Game extends Phaser.Scene {
   private baseSpawnDelay: number = 2200;
 
   // --- БАЛАНС: градация превью и Blind Mode на высоких скоростях ---
-  // Стандартное превью (мс) — держится до множителя x5
+  // Стандартное превью (мс) — держится до множителя x2
   private readonly basePreviewDelay: number = 800;
-  private readonly previewFullUntilMultiplier: number = 5;
-  // На x5→x6 превью плавно ужимается к промежуточным 400мс
+  private readonly previewFullUntilMultiplier: number = 2;
+  // На x2→x3 превью плавно ужимается к промежуточным 400мс
   private readonly previewMidDelay: number = 400;
-  private readonly previewFastAtMultiplier: number = 6;
-  // На x6→x8 сокращается 400мс → 150мс...
+  private readonly previewFastAtMultiplier: number = 3;
+  // На x3→x3.5 сокращается 400мс → 150мс...
   private readonly minPreviewDelay: number = 150;
-  // ...а с x8 включается Blind Mode: превью полностью отключено
-  private readonly blindModeMultiplier: number = 8;
+  // ...а с x3.5 включается Blind Mode: превью полностью отключено
+  private readonly blindModeMultiplier: number = 3.5;
 
-  /** Множитель скорости уровня: +25%/уровень до x5, дальше +16%, без потолка */
+  /** Множитель скорости: +25%/уровень до x3.5, потом +8%/уровень */
   private getCurrentSpeedMult(): number {
-    const fastLevels = Math.round(
-      (this.fastSpeedCapMultiplier - 1) / this.fastSpeedStepPerLevel,
-    ); // уровень, на котором достигается x5 (16)
-    if (this.speedLevel <= fastLevels) {
+    if (this.speedLevel <= this.chaosPhaseLevel) {
       return 1 + this.speedLevel * this.fastSpeedStepPerLevel;
     }
-    return (
-      this.fastSpeedCapMultiplier +
-      (this.speedLevel - fastLevels) * this.normalSpeedStepPerLevel
-    );
+    // После x3.5 — мягкий рост без потолка
+    return this.chaosPhaseMultiplier + (this.speedLevel - this.chaosPhaseLevel) * this.postChaosSpeedStep;
   }
 
   // Палитра препятствий по мере роста множителя скорости: синий → жёлтый → оранжевый → красный
@@ -182,9 +191,31 @@ export class Game extends Phaser.Scene {
   private levelText!: Phaser.GameObjects.Text;
   private levelBarFill!: Phaser.GameObjects.Graphics;
 
-  // --- Blind Mode (x8+): игра без превью волн ---
+  // --- Blind Mode (x3.5+): игра без превью волн ---
   private blindModeActive: boolean = false;
   private blindVignette?: Phaser.GameObjects.Graphics;
+
+  // --- Chaos Phase (x3.5+): разнообразие вместо скорости ---
+  private chaosPhaseActive: boolean = false;
+
+  // --- Tunnel: коридор из 10 волн с2-колоночным проходом ---
+  private tunnelActive: boolean = false;
+  private tunnelWavesRemaining: number = 0;
+  private tunnelWaveIndex: number = 0;
+  private tunnelWarningText?: Phaser.GameObjects.Text;
+  private tunnelHudText?: Phaser.GameObjects.Text;
+  private tunnelSoundOsc: OscillatorNode | null = null;
+  private tunnelSoundGain: GainNode | null = null;
+
+  private readonly TUNNEL_WAVE_COUNT = 10;
+  // === БАЛАНС === 400/1.5 ≈ 267мс между волнами туннеля ===
+  private readonly TUNNEL_WAVE_INTERVAL_MS = 267;
+  // === БАЛАНС === пауза после туннеля 4000/2 = 2000мс ===
+  private readonly TUNNEL_COOLDOWN_MS = 2000;
+  // === БАЛАНС === шанс туннеля после x3.5 (был 20%, стал 10%) ===
+  private readonly TUNNEL_CHANCE_PERCENT = 10;
+  // Змейка: индекс левой колонки2-колоночного прохода (0–3)
+  private readonly TUNNEL_SNAKE: number[] = [0, 1, 2, 3, 2, 1, 0, 1, 2, 3];
 
   // Управление
   private dragStartX: number = 0;
@@ -222,6 +253,11 @@ create() {
     this.isGameOver = false;
     this.gameOverModal = undefined;
     this.blindModeActive = false;
+    this.chaosPhaseActive = false;
+    this.tunnelActive = false;
+    this.tunnelWavesRemaining = 0;
+    this.tunnelWaveIndex = 0;
+    this.stopTunnelSound();
     if (this.blindVignette) {
       this.blindVignette.destroy();
       this.blindVignette = undefined;
@@ -291,8 +327,8 @@ create() {
     // Весь статичный HUD собирается в одном месте
     this.renderHUD();
 
-    // Восстановление прогресса из облака: станция/монеты (берём максимум
-    // локального и облачного) и сохранённый скин, если он открыт.
+    // Восстановление прогресса из облака: станция/монеты/BP/кастомизация
+    // (берём максимум из локального и облачного).
     // Асинхронно и без блокировки — пока грузится, играем с локальным выбором.
     void gameServices
       .loadProgress()
@@ -315,6 +351,15 @@ create() {
           progress.coins > GameState.getCoins()
         ) {
           GameState.addCoins(progress.coins - GameState.getCoins());
+        }
+        if (
+          typeof progress?.blueprints === "number" &&
+          progress.blueprints > GameState.getBlueprints()
+        ) {
+          GameState.addBlueprints(progress.blueprints - GameState.getBlueprints());
+        }
+        if (typeof progress?.lastBpTimestamp === "number" && progress.lastBpTimestamp > 0) {
+          GameState.setLastBpTimestamp(progress.lastBpTimestamp);
         }
 
         if (!progress?.selectedSkin) return;
@@ -636,12 +681,16 @@ create() {
 
     if (paused) {
       this.physics.world.pause();
-      this.time.paused = true; // спавн волн, реген, таймеры бустов
-      this.tweens.pauseAll(); // предупреждения и прочие анимации
+      this.time.paused = true;
+      this.tweens.pauseAll();
+      // TUNNEL: останавливаем звук на паузе
+      if (this.tunnelActive) this.stopTunnelSound();
     } else {
       this.physics.world.resume();
       this.time.paused = false;
       this.tweens.resumeAll();
+      // TUNNEL: возобновляем звук с паузы
+      if (this.tunnelActive) this.startTunnelSound();
     }
     this.drawPauseGlyph();
     this.onPauseChanged?.(paused);
@@ -881,9 +930,16 @@ create() {
   }
 
   private applySkin(skin: SpaceshipSkin) {
-    this.currentSkin = skin;
+    const custom = loadCustomization();
+    const palette = PALETTES.find((p) => p.id === custom.selectedPaletteId) ?? PALETTES[0];
+    this.currentSkin = {
+      ...skin,
+      primaryColor: palette.primary,
+      accentColor: palette.accent,
+      glowColor: palette.glow,
+    };
     selectSkin(skin.id);
-    NeonShipRenderer.updateSkin(this.shipGraphics, skin, this.shipRenderSize());
+    NeonShipRenderer.updateSkin(this.shipGraphics, this.currentSkin, this.shipRenderSize());
     this.updateBorderState(this.defaultBorderColor());
   }
 
@@ -912,7 +968,8 @@ create() {
     const level = GameState.getStation().engineering;
     if (level <= 0) return;
 
-    const intervalMs = Math.max(8000, 20000 - (level - 1) * 3000);
+    // === БАЛАНС === реген: 25с (ур.1) → -4с/уровень → 8с (ур.5)
+    const intervalMs = Math.max(8000, 25000 - (level - 1) * 4000);
     this.time.addEvent({
       delay: intervalMs,
       callback: () => {
@@ -964,9 +1021,14 @@ create() {
       this.cameras.main.flash(250, 0, 243, 255);
     }
 
-    // Blind Mode: при первом пересечении множителем x8 включаем режим
+    // Blind Mode: при первом пересечении множителем x4 включаем режим
     if (this.getPreviewDelay() === 0 && !this.blindModeActive) {
       this.activateBlindMode();
+    }
+
+    // Chaos Phase: при достижении x4+ включаем альтернативные механики
+    if (!this.chaosPhaseActive && this.getCurrentSpeedMult() >= this.chaosPhaseMultiplier) {
+      this.chaosPhaseActive = true;
     }
   }
 
@@ -1061,8 +1123,8 @@ create() {
   }
 
   // === БАЛАНС: длительность превью текущей волны ===
-  // До x5 — стандартные 800мс; x5→x6 — ужимается к 400мс;
-  // x6→x8 — 400мс → 150мс; с x8 — Blind Mode, превью = 0.
+  // До x2 — стандартные 800мс; x2→x3 — ужимается к 400мс;
+  // x3→x3.5 — 400мс → 150мс; с x3.5 — Blind Mode, превью = 0.
   private getPreviewDelay(): number {
     const mult = this.getCurrentSpeedMult();
     if (mult <= this.blindModeMultiplier) {
@@ -1082,7 +1144,7 @@ create() {
             (this.previewMidDelay - this.basePreviewDelay) * t,
         );
       }
-      // Ступень 2: x6 → x8, 400мс → 150мс
+      // Ступень 2: x3 → x4, 400мс → 150мс
       const t = Phaser.Math.Clamp(
         (mult - this.previewFastAtMultiplier) /
           (this.blindModeMultiplier - this.previewFastAtMultiplier),
@@ -1116,9 +1178,9 @@ create() {
   }
 
   // === БАЛАНС: плотность волны зависит от уровня скорости ===
-  // Ранняя игра (эквивалент < x5 по старой шкале): 1–2 препятствия,
-  // середина (~x5–x8): 3, финал (x8+): 2–4 рандомно — стена с проходом,
-  // но непредсказуемой ширины
+  // Ранняя игра (x1–x2): 1–2 препятствия,
+  // середина (x2–x3): 3, хаос (x3.5+): 2–3 — достаточно для сложности,
+  // но без червяков из 4 блоков
   private getObstacleCount(): number {
     if (this.speedLevel <= 4) {
       return Phaser.Math.Between(1, 2);
@@ -1126,7 +1188,7 @@ create() {
     if (this.speedLevel <= 7) {
       return 3;
     }
-    return Phaser.Math.Between(2, 4);
+    return Phaser.Math.Between(2, 3);
   }
 
   private spawnWave() {
@@ -1147,81 +1209,82 @@ create() {
 
     // === БАЛАНС: выбираем N колонок под препятствия, одну — под бонусный
     // проход (невидимый триггер + мелодия), остальные остаются свободными.
-    // Превью у всех не-блочных колонок одинаковое — тонкий белый «прочерк»,
-    // чтобы игрок читал волну, а не искал подсвеченный проход
     const allColumns = Phaser.Utils.Array.Shuffle([0, 1, 2, 3, 4]);
     const obstacleCount = this.getObstacleCount();
     const obstacleColumns = allColumns.slice(0, obstacleCount);
     const safeColumn = allColumns[obstacleCount];
 
+    // === БАЛАНС: максимум 1 движущийся блок в волне (раньше было 2) ===
+    let movingCount = 0;
+    const maxMovingPerWave = 1;
+
     for (let i = 0; i < totalColumns; i++) {
       const x = i * columnWidth + columnWidth / 2;
 
       if (!obstacleColumns.includes(i)) {
-        // Нейтральная метка-проход (как у свободных колонок)
+        // Нейтральная метка-проход
         const marker = this.add.rectangle(
-          x,
-          44,
-          columnWidth - 26,
-          3,
-          0xffffff,
-          0.14,
+          x, 44, columnWidth - 26, 3, 0xffffff, 0.14,
         );
 
         if (i === safeColumn) {
           this.time.delayedCall(previewDelay, () => {
             marker.destroy();
-
-            const gateTrigger = this.add.rectangle(
-              x,
-              spawnY,
-              columnWidth - 10,
-              10,
-              safeColor,
-              0,
-            );
+            const gateTrigger = this.add.rectangle(x, spawnY, columnWidth - 10, 10, safeColor, 0);
             this.gateTriggers.add(gateTrigger);
-
             const gateBody = gateTrigger.body as Phaser.Physics.Arcade.Body;
             gateBody.setVelocityY(fallVelocity);
           });
         } else {
-          this.time.delayedCall(previewDelay, () => {
-            marker.destroy();
-          });
+          this.time.delayedCall(previewDelay, () => marker.destroy());
         }
         continue;
       }
 
       // Препятствие (Стена)
-      const warning = this.add.rectangle(
-        x,
-        40,
-        columnWidth - 10,
-        15,
-        obstacleColor,
-        0.3,
-      );
+      const warning = this.add.rectangle(x, 40, columnWidth - 10, 15, obstacleColor, 0.3);
       warning.setStrokeStyle(1, obstacleColor, 0.6);
 
-      // === БАЛАНС: превью и старт блока от скорости ===
       this.time.delayedCall(previewDelay, () => {
         warning.destroy();
 
-        const block = this.add.rectangle(
-          x,
-          spawnY,
-          columnWidth - 10,
-          45,
-          obstacleColor,
-          0.65,
-        );
-        block.setStrokeStyle(2, strokeColor, 1);
+        // === CHAOS PHASE: стекловидные блоки (полупрозрачные) ===
+        const isGlass = this.chaosPhaseActive && Phaser.Math.Between(1, 100) <= 30;
+        const blockAlpha = isGlass ? 0.35 : 0.65;
 
+        const block = this.add.rectangle(x, spawnY, columnWidth - 10, 45, obstacleColor, blockAlpha);
+        block.setStrokeStyle(isGlass ? 1 : 2, strokeColor, isGlass ? 0.5 : 1);
         this.obstacles.add(block);
 
         const blockBody = block.body as Phaser.Physics.Arcade.Body;
         blockBody.setVelocityY(fallVelocity);
+
+        // === CHAOS PHASE: движущиеся блоки — макс 1 в волне, амплитуда ≤15% колонки ===
+        if (this.chaosPhaseActive && movingCount < maxMovingPerWave && Phaser.Math.Between(1, 100) <= 30) {
+          movingCount++;
+          const driftSpeed = Phaser.Math.Between(25, 45);
+          const driftDir = Phaser.Math.Between(0, 1) === 0 ? -1 : 1;
+          blockBody.setVelocityX(driftSpeed * driftDir);
+
+          const maxOffset = columnWidth * 0.15;
+          const minX = x - maxOffset;
+          const maxX = x + maxOffset;
+          this.tweens.addCounter({
+            from: 0, to: 1,
+            duration: Phaser.Math.Between(1400, 2400),
+            yoyo: true, repeat: -1,
+            onUpdate: (tween) => {
+              if (!block.active) return;
+              const v = tween.getValue() ?? 0;
+              const offsetX = Math.sin(v * Math.PI) * maxOffset * driftDir;
+              const newX = x + offsetX;
+              if (newX >= minX && newX <= maxX) {
+                block.x = newX;
+                blockBody.updateFromGameObject();
+              }
+            },
+          });
+        }
       });
     }
 
@@ -1236,6 +1299,245 @@ create() {
     this.score += 1 * this.scoreMultiplier;
     this.checkSpeedProgression();
     this.updateHUD();
+
+    // === CHAOS PHASE: двойные волны (второй ряд с задержкой) ===
+    if (this.chaosPhaseActive && Phaser.Math.Between(1, 100) <= 35) {
+      this.time.delayedCall(Phaser.Math.Between(600, 1000), () => {
+        if (this.isGameOver || this.isPaused) return;
+        this.spawnChaosWave(columnWidth);
+      });
+    }
+
+    // === TUNNEL: 20% шанс запуска туннеля после x3.5 ===
+    if (
+      this.chaosPhaseActive &&
+      !this.tunnelActive &&
+      Phaser.Math.Between(1, 100) <= this.TUNNEL_CHANCE_PERCENT
+    ) {
+      this.startTunnel();
+    }
+  }
+
+  // === CHAOS PHASE: вторая волна без предупреждения — чистый хаос ===
+  private spawnChaosWave(
+    columnWidth: number,
+  ) {
+    const fallVelocity = this.scale.height * this.currentSpeed;
+    const obstacleColor = this.getSpeedColor();
+    const strokeColor = this.lightenColor(obstacleColor, 0.45);
+
+    // 2 блока, без превью (раньше было 2-3 — ужалили)
+    const count = 2;
+    const columns = Phaser.Utils.Array.Shuffle([0, 1, 2, 3, 4]).slice(0, count);
+
+    // === БАЛАНС: максимум 1 движущийся блок в хаос-волне ===
+    let movingCount = 0;
+
+    for (const i of columns) {
+      const x = i * columnWidth + columnWidth / 2;
+      const isGlass = Phaser.Math.Between(1, 100) <= 25;
+
+      const block = this.add.rectangle(x, -20, columnWidth - 10, 45, obstacleColor, isGlass ? 0.3 : 0.65);
+      block.setStrokeStyle(isGlass ? 1 : 2, strokeColor, isGlass ? 0.5 : 1);
+      this.obstacles.add(block);
+
+      const blockBody = block.body as Phaser.Physics.Arcade.Body;
+      blockBody.setVelocityY(fallVelocity);
+
+      // === БАЛАНС: движущийся блок — макс 1 в волне, амплитуда ≤15% колонки ===
+      if (movingCount < 1 && Phaser.Math.Between(1, 100) <= 25) {
+        movingCount++;
+        const driftSpeed = Phaser.Math.Between(20, 40);
+        const driftDir = Phaser.Math.Between(0, 1) === 0 ? -1 : 1;
+        blockBody.setVelocityX(driftSpeed * driftDir);
+
+        const maxOffset = columnWidth * 0.15;
+        const minX = x - maxOffset;
+        const maxX = x + maxOffset;
+        this.tweens.addCounter({
+          from: 0, to: 1,
+          duration: Phaser.Math.Between(1400, 2200),
+          yoyo: true, repeat: -1,
+          onUpdate: (tween) => {
+            if (!block.active) return;
+            const v = tween.getValue() ?? 0;
+            const offsetX = Math.sin(v * Math.PI) * maxOffset * driftDir;
+            const newX = x + offsetX;
+            if (newX >= minX && newX <= maxX) {
+              block.x = newX;
+              blockBody.updateFromGameObject();
+            }
+          },
+        });
+      }
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // TUNNEL: серия из 10 волн с2-колоночным проходом-змейкой
+  // ═══════════════════════════════════════════════════════════
+
+  /** Запуск туннеля: пауза обычных волн, предупреждение, серия из 10 */
+  private startTunnel(): void {
+    this.tunnelActive = true;
+    this.tunnelWaveIndex = 0;
+    this.tunnelWavesRemaining = this.TUNNEL_WAVE_COUNT;
+
+    // Пауза обычного таймера спавна
+    if (this.spawnTimer) this.spawnTimer.paused = true;
+
+    // Звук туннеля
+    this.startTunnelSound();
+
+    // Предупреждение «TUNNEL!» на 1.5с
+    const w = this.scale.width;
+    this.tunnelWarningText = this.add
+      .text(w / 2, this.scale.height * 0.35, "TUNNEL!", {
+        fontSize: "28px",
+        color: "#ff4444",
+        fontFamily: HUD_FONT,
+        fontStyle: "bold",
+      })
+      .setOrigin(0.5)
+      .setDepth(95)
+      .setAlpha(0);
+    this.tunnelWarningText.setShadow(0, 0, "#ff4444", 20, false, true);
+
+    this.tweens.add({
+      targets: this.tunnelWarningText,
+      alpha: { from: 0, to: 1 },
+      duration: 200,
+      yoyo: true,
+      hold: 800,
+      onComplete: () => {
+        this.tunnelWarningText?.destroy();
+        this.tunnelWarningText = undefined;
+        // Запускаем первую волну туннеля
+        this.time.delayedCall(200, () => this.spawnTunnelWave());
+      },
+    });
+  }
+
+  /** Одна волна туннеля: проход 2 колонки, obstacles в остальных 3 */
+  private spawnTunnelWave(): void {
+    if (this.isGameOver || !this.tunnelActive) return;
+
+    const screenWidth = this.scale.width;
+    const totalColumns = 5;
+    const columnWidth = screenWidth / totalColumns;
+    const fallVelocity = this.scale.height * this.currentSpeed;
+    const obstacleColor = this.getSpeedColor();
+    const strokeColor = this.lightenColor(obstacleColor, 0.45);
+
+    // Позиция прохода из змейки
+    const snakeIdx = this.TUNNEL_SNAKE[this.tunnelWaveIndex % this.TUNNEL_SNAKE.length];
+    const passageCols = [snakeIdx, snakeIdx + 1];
+
+    // Превью: зелёные метки прохода (300мс)
+    const previewMs = 300;
+    for (const col of passageCols) {
+      const px = col * columnWidth + columnWidth / 2;
+      const preview = this.add.rectangle(px, 40, columnWidth - 10, 15, 0x00ff88, 0.4);
+      preview.setStrokeStyle(1, 0x00ff88, 0.8);
+      this.time.delayedCall(previewMs, () => preview.destroy());
+    }
+
+    // После превью — спавним obstacles в 3 непроходных колонках
+    this.time.delayedCall(previewMs, () => {
+      if (this.isGameOver || !this.tunnelActive) return;
+
+      for (let i = 0; i < totalColumns; i++) {
+        if (passageCols.includes(i)) continue;
+
+        const bx = i * columnWidth + columnWidth / 2;
+        const block = this.add.rectangle(bx, -20, columnWidth - 10, 45, obstacleColor, 0.65);
+        block.setStrokeStyle(2, strokeColor, 1);
+        this.obstacles.add(block);
+
+        const blockBody = block.body as Phaser.Physics.Arcade.Body;
+        blockBody.setVelocityY(fallVelocity);
+      }
+
+      // Очки и HUD
+      this.score += 1 * this.scoreMultiplier;
+      this.checkSpeedProgression();
+      this.updateHUD();
+      this.pulseTunnelSound();
+
+      // Следующая волна или завершение
+      this.tunnelWaveIndex++;
+      this.tunnelWavesRemaining--;
+
+      if (this.tunnelWavesRemaining > 0) {
+        this.time.delayedCall(this.TUNNEL_WAVE_INTERVAL_MS - previewMs, () =>
+          this.spawnTunnelWave(),
+        );
+      } else {
+        this.endTunnel();
+      }
+    });
+  }
+
+  /** Завершение туннеля: пауза 4с, затем возобновление обычных волн */
+  private endTunnel(): void {
+    this.tunnelActive = false;
+    this.stopTunnelSound();
+
+    // Убираем HUD туннеля
+    if (this.tunnelHudText) {
+      this.tunnelHudText.destroy();
+      this.tunnelHudText = undefined;
+    }
+
+    // Возобновляем обычные волны через паузу
+    this.time.delayedCall(this.TUNNEL_COOLDOWN_MS, () => {
+      if (!this.isGameOver && this.scene.isActive() && this.spawnTimer) {
+        this.spawnTimer.paused = false;
+      }
+    });
+  }
+
+  // --- Звук туннеля: тихий синус 220Гц с пульсацией ---
+
+  private startTunnelSound(): void {
+    if (!this.audioCtx) return;
+    this.resumeAudio();
+
+    this.tunnelSoundOsc = this.audioCtx.createOscillator();
+    this.tunnelSoundGain = this.audioCtx.createGain();
+    this.tunnelSoundOsc.type = "sine";
+    this.tunnelSoundOsc.frequency.setValueAtTime(220, this.audioCtx.currentTime);
+
+    this.tunnelSoundGain.gain.setValueAtTime(0, this.audioCtx.currentTime);
+    this.tunnelSoundGain.gain.linearRampToValueAtTime(
+      0.06,
+      this.audioCtx.currentTime + 0.4,
+    );
+
+    this.tunnelSoundOsc.connect(this.tunnelSoundGain);
+    this.tunnelSoundGain.connect(this.audioCtx.destination);
+    this.tunnelSoundOsc.start();
+  }
+
+  private pulseTunnelSound(): void {
+    if (!this.tunnelSoundGain || !this.audioCtx) return;
+    const now = this.audioCtx.currentTime;
+    this.tunnelSoundGain.gain.cancelScheduledValues(now);
+    this.tunnelSoundGain.gain.setValueAtTime(0.14, now);
+    this.tunnelSoundGain.gain.linearRampToValueAtTime(0.06, now + 0.4);
+  }
+
+  private stopTunnelSound(): void {
+    if (!this.tunnelSoundOsc || !this.tunnelSoundGain || !this.audioCtx) return;
+    const now = this.audioCtx.currentTime;
+    this.tunnelSoundGain.gain.cancelScheduledValues(now);
+    this.tunnelSoundGain.gain.linearRampToValueAtTime(0, now + 0.4);
+    const osc = this.tunnelSoundOsc;
+    setTimeout(() => {
+      try { osc.stop(); } catch { /* already stopped */ }
+    }, 500);
+    this.tunnelSoundOsc = null;
+    this.tunnelSoundGain = null;
   }
 
   private spawnBetweenWaveBoost(totalColumns: number, columnWidth: number) {
@@ -1289,10 +1591,10 @@ create() {
     bombGfx.fillCircle(0, 0, 14);
     bombGfx.lineStyle(2, 0xff8899, 1);
     bombGfx.strokeCircle(0, 0, 14);
-    // Тёмный «крест»-детонатор
+    // Тёмный «икс»-детонатор (45°)
     bombGfx.lineStyle(2.5, 0x550008, 0.95);
-    bombGfx.lineBetween(-8, 0, 8, 0);
-    bombGfx.lineBetween(0, -8, 0, 8);
+    bombGfx.lineBetween(-6, -6, 6, 6);
+    bombGfx.lineBetween(-6, 6, 6, -6);
     // Блик
     bombGfx.fillStyle(0xffffff, 0.85);
     bombGfx.fillCircle(-5, -5, 3);
@@ -1512,6 +1814,8 @@ create() {
       selectedSkin: this.currentSkin.id,
       stationLevels: station,
       coins: GameState.getCoins(),
+      blueprints: GameState.getBlueprints(),
+      lastBpTimestamp: GameState.getLastBpTimestamp(),
     });
 
     this.gameOverModal = new GameOverModal(
@@ -1543,6 +1847,8 @@ create() {
       selectedSkin: this.currentSkin.id,
       stationLevels: GameState.getStation(),
       coins: GameState.getCoins(),
+      blueprints: GameState.getBlueprints(),
+      lastBpTimestamp: GameState.getLastBpTimestamp(),
     });
   }
 
@@ -1552,9 +1858,15 @@ create() {
     const currentMult = this.getCurrentSpeedMult().toFixed(2);
     this.speedText.setText(`x${currentMult}`);
 
-    // Нижняя плашка: номер уровня = количество умножений скорости,
-    // бар — прогресс до следующего умножения
-    this.levelText.setText(`LEVEL ${this.speedLevel}`);
+    // Нижняя плашка: туннель > хаос > обычный уровень
+    if (this.tunnelActive) {
+      const remaining = this.TUNNEL_WAVE_COUNT - this.tunnelWaveIndex;
+      this.levelText.setText(`TUNNEL ${remaining}/${this.TUNNEL_WAVE_COUNT}`);
+    } else if (this.chaosPhaseActive) {
+      this.levelText.setText("CHAOS");
+    } else {
+      this.levelText.setText(`LEVEL ${this.speedLevel}`);
+    }
     const p = this.getNextLevelProgress();
     this.levelBarFill.clear();
     this.levelBarFill.fillStyle(this.getSpeedColor(), 0.95);

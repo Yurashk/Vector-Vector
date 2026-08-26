@@ -1,12 +1,18 @@
 // ============================================================
 // FirebaseAdapter — реализация ICloudService поверх Firebase.
 //
-// Структура данных в Firestore:
-//   players/{userId}     -> { achievements, selectedShip, selectedSkin, playerName }
+// ВСЕ данные игрока хранятся в одной коллекции:
+//   players/{userId} -> {
+//     achievements, selectedShip, selectedSkin, playerName,
+//     stationLevels, coins, blueprints, lastBpTimestamp,
+//     customization: { selectedModelId, selectedPaletteId,
+//                      unlockedModels[], unlockedPalettes[] }
+//   }
 //   leaderboard/{userId} -> { userId, playerName, score, updatedAt }
 //
-// Документ лидерборда ключуется по userId: один игрок — одна запись
-// с его личным рекордом (защита от спама дублями).
+// localStorage используется ТОЛЬКО как fallback-кэш для оффлайна:
+//   vv-user-id, vv-player-name, game_coins, game_blueprints,
+//   game_bp_ts, game_station, vv_customization
 // ============================================================
 
 import { initializeApp } from "firebase/app";
@@ -83,15 +89,31 @@ export class FirebaseAdapter implements ICloudService {
     return this.userId;
   }
 
+  // ─── saveProgress: пишет в players/{userId} ─────────────────
+
   async saveProgress(data: ProgressData): Promise<void> {
     await this.ensureReady();
     const db = getFirestore();
-    await setDoc(
-      doc(db, "players", this.userId),
-      { ...data, playerName: this.playerName },
-      { merge: true },
-    );
+
+    // Формируем объект для записи — только определённые поля,
+    // чтобы не затереть существующие данные при merge.
+    const update: Record<string, unknown> = {
+      playerName: this.playerName,
+    };
+
+    if (data.achievements) update.achievements = data.achievements;
+    if (data.selectedShip) update.selectedShip = data.selectedShip;
+    if (data.selectedSkin) update.selectedSkin = data.selectedSkin;
+    if (data.stationLevels) update.stationLevels = data.stationLevels;
+    if (typeof data.coins === "number") update.coins = data.coins;
+    if (typeof data.blueprints === "number") update.blueprints = data.blueprints;
+    if (typeof data.lastBpTimestamp === "number") update.lastBpTimestamp = data.lastBpTimestamp;
+    if (data.customization) update.customization = data.customization;
+
+    await setDoc(doc(db, "players", this.userId), update, { merge: true });
   }
+
+  // ─── loadProgress: читает players/{userId} ──────────────────
 
   async loadProgress(): Promise<ProgressData | null> {
     await this.ensureReady();
@@ -99,22 +121,38 @@ export class FirebaseAdapter implements ICloudService {
     const snap = await getDoc(doc(db, "players", this.userId));
     if (!snap.exists()) return null;
 
-    // В документе игрока также хранится playerName
-    const data = snap.data() as Partial<ProgressData> & {
-      playerName?: string;
-    };
-    if (typeof data.playerName === "string") {
-      this.playerName = data.playerName;
+    const d = snap.data();
+
+    // Извлекаем ник, если есть
+    if (typeof d.playerName === "string") {
+      this.playerName = d.playerName;
       this.storePlayerName(this.playerName);
     }
+
     return {
-      achievements: data.achievements ?? [],
-      selectedShip: data.selectedShip ?? "",
-      selectedSkin: data.selectedSkin ?? "",
-      stationLevels: data.stationLevels,
-      coins: data.coins,
+      achievements: Array.isArray(d.achievements) ? d.achievements : [],
+      selectedShip: String(d.selectedShip ?? ""),
+      selectedSkin: String(d.selectedSkin ?? ""),
+      stationLevels: d.stationLevels,
+      coins: typeof d.coins === "number" ? d.coins : undefined,
+      blueprints: typeof d.blueprints === "number" ? d.blueprints : undefined,
+      lastBpTimestamp: typeof d.lastBpTimestamp === "number" ? d.lastBpTimestamp : undefined,
+      customization: d.customization
+        ? {
+            selectedModelId: String(d.customization.selectedModelId ?? "scout"),
+            selectedPaletteId: String(d.customization.selectedPaletteId ?? "cyan"),
+            unlockedModels: Array.isArray(d.customization.unlockedModels)
+              ? d.customization.unlockedModels
+              : ["scout"],
+            unlockedPalettes: Array.isArray(d.customization.unlockedPalettes)
+              ? d.customization.unlockedPalettes
+              : ["cyan"],
+          }
+        : undefined,
     };
   }
+
+  // ─── submitScore: лидерборд ────────────────────────────────
 
   async submitScore(score: number, playerName?: string): Promise<void> {
     await this.ensureReady();
@@ -124,7 +162,6 @@ export class FirebaseAdapter implements ICloudService {
       this.storePlayerName(playerName);
     }
     if (!this.playerName) {
-      // Автоматический ник: Player_ + 4 случайные цифры
       this.playerName =
         localStorage.getItem(LOCAL_NAME_KEY) ??
         "Player_" + Math.floor(1000 + Math.random() * 9000);
@@ -134,8 +171,6 @@ export class FirebaseAdapter implements ICloudService {
     const db = getFirestore();
     const ref = doc(db, "leaderboard", this.userId);
 
-    // Транзакция: обновляем запись только если новый результат лучше,
-    // чтобы лидерборд всегда хранил личный рекорд игрока.
     await runTransaction(db, async (tx) => {
       const snap = await tx.get(ref);
       const best = snap.exists() ? Number(snap.data().score ?? 0) : -1;
@@ -171,37 +206,152 @@ export class FirebaseAdapter implements ICloudService {
     });
   }
 
-  // --- Данные пользователя (Firestore: users/{userId}) ---
+  // ─── saveUserData: пишет в players/{userId} ────────────────
 
   async saveUserData(data: UserData): Promise<void> {
     await this.ensureReady();
     const db = getFirestore();
-    await setDoc(doc(db, "users", this.userId), data, { merge: true });
+
+    // Конвертируем UserData в формат players/{userId}
+    const update: Record<string, unknown> = {
+      playerName: this.playerName,
+      coins: data.currencies.credits,
+      blueprints: data.currencies.blueprints,
+      lastBpTimestamp: data.currencies.lastBpTimestamp,
+      stationLevels: data.station,
+      customization: data.customization,
+    };
+
+    await setDoc(doc(db, "players", this.userId), update, { merge: true });
   }
+
+  // ─── loadUserData: читает players/{userId} ─────────────────
 
   async loadUserData(): Promise<UserData | null> {
     await this.ensureReady();
     const db = getFirestore();
-    const snap = await getDoc(doc(db, "users", this.userId));
+    const snap = await getDoc(doc(db, "players", this.userId));
     if (!snap.exists()) return null;
 
     const d = snap.data();
+
+    // Извлекаем ник
+    if (typeof d.playerName === "string") {
+      this.playerName = d.playerName;
+      this.storePlayerName(this.playerName);
+    }
+
+    const customization = d.customization;
+
     return {
       currencies: {
-        credits: Number(d.currencies?.credits ?? 0),
-        blueprints: Number(d.currencies?.blueprints ?? 0),
+        credits: Number(d.coins ?? 0),
+        blueprints: Number(d.blueprints ?? 0),
+        lastBpTimestamp: Number(d.lastBpTimestamp ?? 0),
       },
-      station: (d.station as Record<string, number>) ?? {},
+      station: (d.stationLevels as Record<string, number>) ?? {},
       inventory: {
-        equippedShip: String(d.inventory?.equippedShip ?? ""),
-        unlockedSkins: Array.isArray(d.inventory?.unlockedSkins)
-          ? d.inventory.unlockedSkins
+        equippedShip: String(d.selectedShip ?? ""),
+        unlockedSkins: Array.isArray(customization?.unlockedModels)
+          ? customization.unlockedModels
           : [],
+      },
+      customization: {
+        selectedModelId: String(customization?.selectedModelId ?? "scout"),
+        selectedPaletteId: String(customization?.selectedPaletteId ?? "cyan"),
+        unlockedModels: Array.isArray(customization?.unlockedModels)
+          ? customization.unlockedModels
+          : ["scout"],
+        unlockedPalettes: Array.isArray(customization?.unlockedPalettes)
+          ? customization.unlockedPalettes
+          : ["cyan"],
       },
     };
   }
 
-  // --- Внутренние методы ---
+  // ─── unlockModel: атомарная транзакция в players/{userId} ──
+
+  async unlockModel(modelId: string, priceCR: number): Promise<boolean> {
+    await this.ensureReady();
+    const db = getFirestore();
+    const ref = doc(db, "players", this.userId);
+    try {
+      return await runTransaction(db, async (tx) => {
+        const snap = await tx.get(ref);
+        const d = snap.exists() ? snap.data() : {};
+        const cr = Number(d.coins ?? 0);
+        const customization = d.customization ?? {};
+        const models: string[] = Array.isArray(customization.unlockedModels)
+          ? customization.unlockedModels
+          : ["scout"];
+        if (models.includes(modelId)) return true;
+        if (cr < priceCR) return false;
+        tx.set(ref, {
+          coins: cr - priceCR,
+          customization: { unlockedModels: [...models, modelId] },
+        }, { merge: true });
+        return true;
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  // ─── unlockPalette: атомарная транзакция в players/{userId} ─
+
+  async unlockPalette(paletteId: string, priceBP: number): Promise<boolean> {
+    await this.ensureReady();
+    const db = getFirestore();
+    const ref = doc(db, "players", this.userId);
+    try {
+      return await runTransaction(db, async (tx) => {
+        const snap = await tx.get(ref);
+        const d = snap.exists() ? snap.data() : {};
+        const bp = Number(d.blueprints ?? 0);
+        const customization = d.customization ?? {};
+        const palettes: string[] = Array.isArray(customization.unlockedPalettes)
+          ? customization.unlockedPalettes
+          : ["cyan"];
+        if (palettes.includes(paletteId)) return true;
+        if (bp < priceBP) return false;
+        tx.set(ref, {
+          blueprints: bp - priceBP,
+          customization: { unlockedPalettes: [...palettes, paletteId] },
+        }, { merge: true });
+        return true;
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  // ─── equipCustomization: обновляет players/{userId} ─────────
+
+  async equipCustomization(modelId: string, paletteId: string): Promise<void> {
+    await this.ensureReady();
+    const db = getFirestore();
+    await setDoc(doc(db, "players", this.userId), {
+      selectedShip: modelId,
+      selectedSkin: modelId,
+      customization: {
+        selectedModelId: modelId,
+        selectedPaletteId: paletteId,
+      },
+    }, { merge: true });
+  }
+
+  // ─── updateBlueprintsToCloud: обновляет BP в players/{userId} ─
+
+  async updateBlueprintsToCloud(blueprints: number, lastBpTimestamp: number): Promise<void> {
+    await this.ensureReady();
+    const db = getFirestore();
+    await setDoc(doc(db, "players", this.userId), {
+      blueprints,
+      lastBpTimestamp,
+    }, { merge: true });
+  }
+
+  // ─── Внутренние методы ──────────────────────────────────────
 
   /** Гарантирует, что init() был вызван перед любой операцией */
   private async ensureReady(): Promise<void> {

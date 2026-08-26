@@ -327,6 +327,184 @@ export const SPACESHIP_SKINS: SpaceshipSkin[] = [
     ],
   },
   {
+    id: "spectre",
+    name: "Spectre",
+    price: 0,
+    unlocked: true,
+    primaryColor: 0x00ffcc, // Яркий изумрудно-мятный неон
+    accentColor: 0xffffff,
+    glowColor: 0x00ffaa,
+    gapSize: 1,
+    requiredDesignLevel: 1,
+    parts: [
+      // --- РАЗДВОЕННЫЙ НОС (ЛЕВЫЙ КЛЫК / ПИЛОН) ---
+      {
+        type: "polygon",
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        points: [-6, -30, -10, -16, -4, -12],
+      },
+      {
+        type: "polygon",
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        points: [-6, -30, -4, -12, -2, -18],
+        accent: true,
+      },
+
+      // --- РАЗДВОЕННЫЙ НОС (ПРАВЫЙ КЛЫК / ПИЛОН) ---
+      {
+        type: "polygon",
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        points: [6, -30, 2, -18, 4, -12],
+        accent: true,
+      },
+      {
+        type: "polygon",
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        points: [6, -30, 4, -12, 10, -16],
+      },
+
+      // --- ЦЕНТРАЛЬНОЕ ЯДРО / КАБИНА ---
+      {
+        type: "polygon",
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        points: [0, -18, -4, -12, 0, -4],
+        accent: true,
+      },
+      {
+        type: "polygon",
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        points: [0, -18, 0, -4, 4, -12],
+        accent: true,
+      },
+      {
+        type: "polygon",
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        points: [-4, -12, -7, 2, 0, -4],
+      },
+      {
+        type: "polygon",
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        points: [4, -12, 0, -4, 7, 2],
+      },
+
+      // --- КРЫЛЬЯ ОБРАТНОЙ СТРЕЛОВИДНОСТИ (ЛЕВОЕ КРЫЛО) ---
+      {
+        type: "polygon",
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        points: [-10, -16, -24, -6, -15, 4],
+      },
+      {
+        type: "polygon",
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        points: [-24, -6, -15, 4, -20, 14],
+        accent: true,
+      },
+      {
+        type: "polygon",
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        points: [-15, 4, -7, 2, -10, 12],
+      },
+
+      // --- КРЫЛЬЯ ОБРАТНОЙ СТРЕЛОВИДНОСТИ (ПРАВОЕ КРЫЛО) ---
+      {
+        type: "polygon",
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        points: [10, -16, 15, 4, 24, -6],
+      },
+      {
+        type: "polygon",
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        points: [24, -6, 20, 14, 15, 4],
+        accent: true,
+      },
+      {
+        type: "polygon",
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        points: [15, 4, 10, 12, 7, 2],
+      },
+
+      // --- КОРМА И ДВИГАТЕЛИ ---
+      {
+        type: "polygon",
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        points: [-7, 2, -10, 12, 0, 18],
+      },
+      {
+        type: "polygon",
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        points: [7, 2, 0, 18, 10, 12],
+        accent: true,
+      },
+      // Центральный сопловый соты-выхлоп
+      {
+        type: "polygon",
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        points: [-4, 14, 0, 24, 0, 18],
+        accent: true,
+      },
+      {
+        type: "polygon",
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        points: [0, 18, 0, 24, 4, 14],
+        accent: true,
+      },
+    ],
+  },
+  {
     id: "dreadnought",
     name: "Dreadnought",
     price: 0,
@@ -487,6 +665,22 @@ SPACESHIP_SKINS.push(
     primaryColor: 0xff2222, // алый неон
     accentColor: 0xffb3b3,
     glowColor: 0xff4444,
+  }),
+  cloneWithColors(SPACESHIP_SKINS[3], {
+    id: "eclipse",
+    name: "Eclipse",
+    requiredDesignLevel: 4,
+    primaryColor: 0x6600cc, // тёмно-фиолетовый неон
+    accentColor: 0xcc99ff,
+    glowColor: 0x8833ff,
+  }),
+  cloneWithColors(SPACESHIP_SKINS[0], {
+    id: "nova",
+    name: "Nova",
+    requiredDesignLevel: 5,
+    primaryColor: 0xffcc00, // золотой неон
+    accentColor: 0xffffff,
+    glowColor: 0xffaa00,
   }),
 );
 

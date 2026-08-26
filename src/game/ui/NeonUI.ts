@@ -42,7 +42,7 @@ export const GameState = {
     parseInt(localStorage.getItem("game_coins") || "1250", 10),
 
   addCoins: (val: number): number => {
-    const current = GameState.getCoins() + val;
+    const current = Math.max(0, GameState.getCoins() + val);
     localStorage.setItem("game_coins", current.toString());
     return current;
   },
@@ -143,6 +143,51 @@ export const GameState = {
       GameState.setLastLifeRestoreTime(lives >= max ? now : last);
     }
     return lives;
+  },
+
+  // === БАЛАНС: BP генерируются Design Wing пассивно (как жизни) ===
+  // Скорость генерации зависит от уровня Design Wing (BP/час)
+  // === БАЛАНС === BP/час по уровню Design Wing (0..5)
+  BP_RATES: [0, 8, 20, 40, 60, 80] as readonly number[],
+  BP_SYNC_INTERVAL_MS: 60 * 60 * 1000, // 1 час — минимальный интервал начисления
+
+  getLastBpTimestamp: (): number =>
+    parseInt(localStorage.getItem("game_bp_ts") || "0", 10),
+
+  setLastBpTimestamp: (ts: number): void => {
+    try {
+      localStorage.setItem("game_bp_ts", ts.toString());
+    } catch {
+      /* память недоступна */
+    }
+  },
+
+  /**
+   * Синхронизация BP: начисляет чертежи за прошедшее время
+   * пропорционально уровню Design Wing. Вызывать при входе
+   * в Garage/Station, чтобы BP были актуальны.
+   */
+  syncBlueprints: (): number => {
+    const designLevel = GameState.getStation().design;
+    const rate = GameState.BP_RATES[designLevel] ?? 0;
+    if (rate <= 0) return GameState.getBlueprints();
+
+    const now = Date.now();
+    let last = GameState.getLastBpTimestamp();
+
+    if (last <= 0) {
+      GameState.setLastBpTimestamp(now);
+      return GameState.getBlueprints();
+    }
+
+    const elapsed = now - last;
+    const gained = Math.floor(elapsed / GameState.BP_SYNC_INTERVAL_MS);
+    if (gained > 0) {
+      GameState.addBlueprints(gained * rate);
+      last += gained * GameState.BP_SYNC_INTERVAL_MS;
+      GameState.setLastBpTimestamp(last);
+    }
+    return GameState.getBlueprints();
   },
 
   /** Миллисекунд до следующей жизни; 0 — запас полон */
@@ -390,13 +435,13 @@ export function drawCurrencyIcon(
   g.clear();
 
   if (type === "CR") {
-    // === Кристалл / Ромб (Gold 0xffb700) ===
+    // === Кристалл / Ромб (Gold 0xffb700) — чистый, без внутренних деталей ===
     const col = 0xffb700;
     const hw = size * 0.75;
     const hh = size;
 
-    // Внешнее гало
-    g.lineStyle(6, col, 0.1);
+    // Гало
+    g.lineStyle(5, col, 0.12);
     g.beginPath();
     g.moveTo(0, -hh);
     g.lineTo(hw, 0);
@@ -405,26 +450,17 @@ export function drawCurrencyIcon(
     g.closePath();
     g.strokePath();
 
-    // Тело ромба — два треугольника (верх + низ)
-    // Верхний треугольник (ярче)
-    g.fillStyle(col, 0.55);
+    // Заливка ромба (сплошная)
+    g.fillStyle(col, 0.5);
     g.beginPath();
     g.moveTo(0, -hh);
     g.lineTo(hw, 0);
+    g.lineTo(0, hh);
     g.lineTo(-hw, 0);
     g.closePath();
     g.fillPath();
 
-    // Нижний треугольник (приглушённый)
-    g.fillStyle(col, 0.3);
-    g.beginPath();
-    g.moveTo(0, hh);
-    g.lineTo(hw, 0);
-    g.lineTo(-hw, 0);
-    g.closePath();
-    g.fillPath();
-
-    // Яркий контур
+    // Контур
     g.lineStyle(1.8, col, 0.95);
     g.beginPath();
     g.moveTo(0, -hh);
@@ -433,15 +469,6 @@ export function drawCurrencyIcon(
     g.lineTo(-hw, 0);
     g.closePath();
     g.strokePath();
-
-    // Внутренние световые блики — горизонталь + вертикаль
-    g.lineStyle(1, 0xffffff, 0.7);
-    g.lineBetween(-hw * 0.5, -hh * 0.25, hw * 0.5, -hh * 0.25);
-    g.lineBetween(0, -hh * 0.65, 0, hh * 0.4);
-
-    // Точка блика
-    g.fillStyle(0xffffff, 0.9);
-    g.fillCircle(-hw * 0.25, -hh * 0.35, 1.5);
   } else {
     // === BP: Мишень / Чип (Pink 0xff007f) ===
     const col = 0xff007f;

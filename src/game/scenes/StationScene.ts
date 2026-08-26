@@ -16,6 +16,7 @@ import * as Phaser from "phaser";
 import {
   COLOR_BG,
   COLOR_CYAN,
+  COLOR_DARK_PANEL,
   COLOR_GOLD,
   COLOR_PINK,
   COLOR_PURPLE,
@@ -29,6 +30,7 @@ import {
 import { gameServices } from "../../services/GameServicesManager";
 import { CoinPlate } from "../ui/CoinPlate";
 import { getSelectedSkin } from "../spaceship-skins";
+import { loadCustomization } from "../garage-data";
 
 // ============================================================
 // Конфигурация отсеков станции
@@ -54,15 +56,14 @@ const MODULES: StationModule[] = [
     description: "Auto-repairs hull damage during runs. Higher levels mean faster repairs, keeping you alive longer.",
     maxLevel: 5,
     color: COLOR_CYAN,
-    // === БАЛАНС === ур.1 — реген каждые 20с, каждый уровень на 3с быстрее,
-    // минимум 8с (значения дублируются в Game.setupLifeRegen)
-    costs: [400, 800, 1600, 3200, 6400],
-    // === БАЛАНС === время стройки по уровням: 5/15/30/60/90 минут
-    buildDurationsMs: [5, 15, 30, 60, 90].map((m) => m * 60_000),
+    // === БАЛАНС === ур.1 — реген каждые 25с, каждый уровень быстрее до 8с
+    costs: [250, 600, 1400, 3000, 6500],
+    // === БАЛАНС === время стройки: 3/10/30/60/120 минут
+    buildDurationsMs: [3, 10, 30, 60, 120].map((m) => m * 60_000),
     effectText: (level) =>
       level === 0
         ? "NO AUTO REPAIR"
-        : `AUTO REPAIR EVERY ${Math.max(8, 20 - (level - 1) * 3)}S`,
+        : `AUTO REPAIR EVERY ${Math.max(8, 25 - (level - 1) * 4)}S`,
   },
   {
     key: "finance",
@@ -71,24 +72,27 @@ const MODULES: StationModule[] = [
     maxLevel: 5,
     color: COLOR_GOLD,
     // === БАЛАНС === +10% монет за уровень (x1.1 … x1.5),
-    // значения дублируются в Game.showGameOver
-    costs: [400, 800, 1600, 3200, 6400],
-    // === БАЛАНС === время стройки по уровням: 5/15/30/60/90 минут
-    buildDurationsMs: [5, 15, 30, 60, 90].map((m) => m * 60_000),
+    costs: [300, 750, 1800, 4000, 8500],
+    // === БАЛАНС === время стройки: 3/10/30/60/120 минут
+    buildDurationsMs: [3, 10, 30, 60, 120].map((m) => m * 60_000),
     effectText: (level) =>
       `COIN INCOME x${(1 + level * 0.1).toFixed(1)} PER RUN`,
   },
   {
     key: "design",
     title: "DESIGN WING",
-    description: "Unlocks new ship skins and blueprints. Each level reveals a unique ship design.",
-    maxLevel: 3,
+    description: "Unlocks new ship skins and blueprints. Each level reveals unique ship designs and boosts BP generation.",
+    maxLevel: 5,
     color: COLOR_PINK,
-    // === БАЛАНС === каждый уровень открывает один новый скин корабля
-    costs: [500, 1500, 4000],
-    // === БАЛАНС === время стройки по уровням: 10/30/60 минут
-    buildDurationsMs: [10, 30, 60].map((m) => m * 60_000),
-    effectText: (level) => `${3 + level} SHIP DESIGNS UNLOCKED`,
+    // === БАЛАНС === каждый уровень открывает новые скины + BP/ч
+    costs: [400, 1200, 3000, 6000, 12000],
+    // === БАЛАНС === время стройки: 5/20/45/90/120 минут
+    buildDurationsMs: [5, 20, 45, 90, 120].map((m) => m * 60_000),
+    effectText: (level) => {
+      const skins = [3, 5, 6, 7, 8, 9][level];
+      const bpHr = [0, 8, 20, 40, 60, 80][level];
+      return `${skins} SKINS UNLOCKED · ${bpHr} BP/HR`;
+    },
   },
 ];
 
@@ -125,32 +129,6 @@ interface IsoStyle {
   edgeColor?: number;
   /** Сколько линий охлаждения/окон нарисовать на стенах */
   windowCount?: number; 
-}
-
-/** Посадочная площадка: неоновый эллипс с угловыми метками */
-function drawLandingPad(
-  g: Phaser.GameObjects.Graphics,
-  hw: number,
-  hh: number,
-  depth: number,
-  color: number,
-): void {
-  const padRx = hw + 18;
-  const padRy = Math.round(padRx / 2.4);
-  const padY = hh + depth + 2;
-
-  g.lineStyle(1.5, color, 0.35);
-  g.strokeEllipse(0, padY, padRx * 2, padRy * 2);
-  g.lineStyle(2, color, 0.5);
-  [
-    [-padRx + 6, 0],
-    [padRx - 6, 0],
-    [0, -padRy + 4],
-    [0, padRy - 4],
-  ].forEach(([tx, ty]) => {
-    g.lineBetween(tx - 4, padY + ty, tx + 4, padY + ty);
-    g.lineBetween(tx, padY + ty - 4, tx, padY + ty + 4);
-  });
 }
 
 /** Изометрический корпус: стены, крышка, луч в небо и рёбра охлаждения */
@@ -257,11 +235,10 @@ function strokeIsoEdges(
 }
 
 // ============================================================
-// StationBuilding — изометрическое неоновое здание отсека.
-// Рисуется через Graphics: посадочная площадка (эллипс), ромб
-// верхней грани, две боковые грани-стены, окна по уровню,
-// антенна с мигающим маячком. Над зданием парят название
-// и ромбовидные пипсы уровня.
+// StationBuilding — неоновый модуль станции (минималистичный стиль).
+// Каждый модуль — уникальная геометрическая форма с неоновым
+// контуром: шестиугольник (Engineering), круг (Finance),
+// ромб (Design). Иконка по центру, уровень — сегменты вокруг.
 // ============================================================
 
 class StationBuilding extends Phaser.GameObjects.Container {
@@ -269,35 +246,24 @@ class StationBuilding extends Phaser.GameObjects.Container {
 
   private level: number;
   private readonly onSelect: (building: StationBuilding) => void;
-  /** Базовый масштаб из layout; эффекты ховера умножаются на него */
   private baseScale = 1;
-  /** Здание заблокировано (уровень 0) — затемнение + отключение луча */
   private locked = false;
 
   private shapeGfx!: Phaser.GameObjects.Graphics;
   private fxGfx!: Phaser.GameObjects.Graphics;
-  private labelBox!: Phaser.GameObjects.Container;
-  private nameText!: Phaser.GameObjects.Text;
-  private pipsG!: Phaser.GameObjects.Graphics;
   private glyphGfx!: Phaser.GameObjects.Graphics;
   private beacon!: Phaser.GameObjects.Arc;
   private buildText?: Phaser.GameObjects.Text;
   private wrenchGfx?: Phaser.GameObjects.Graphics;
 
-  // --- Статус-бейджи (READY / UNDER CONSTRUCTION / MAX) ---
   private statusBadge!: Phaser.GameObjects.Container;
   private statusBg!: Phaser.GameObjects.Graphics;
   private statusText!: Phaser.GameObjects.Text;
   private buildProgressBar?: Phaser.GameObjects.Graphics;
 
-  /** Активный (несобранный) буст над зданием — не больше одного */
   public hasActiveBoost = false;
 
-  // Габариты изометрии
-  private static readonly HALF_W = 52;
-  private static readonly HALF_H = 24;
-  /** Y-координата иконки на крышке (центр верхней грани) */
-  private static readonly GLYPH_Y = -3;
+  private static readonly POD_R = 44;
 
   constructor(
     scene: Phaser.Scene,
@@ -311,30 +277,13 @@ class StationBuilding extends Phaser.GameObjects.Container {
     this.onSelect = onSelect;
 
     this.shapeGfx = scene.add.graphics();
-
-    // Слой спецеффектов отсека (сварка/волны/лазер) — рисуется в redraw()
     this.fxGfx = scene.add.graphics();
-
-    // Логотип-проекция на верхней грани корпуса (векторная иконка)
     this.glyphGfx = scene.add.graphics();
-    this.glyphGfx.setPosition(0, StationBuilding.GLYPH_Y);
-
-    // Парящая подпись: название + пипсы уровня
-    this.nameText = scene.add
-      .text(0, 0, module.title, {
-        fontSize: "13px",
-        color: "#ffffff",
-        fontStyle: "bold",
-      })
-      .setOrigin(0.5);
-    this.pipsG = scene.add.graphics();
-    this.labelBox = scene.add.container(0, 0, [this.nameText, this.pipsG]);
 
     this.beacon = scene.add.circle(0, 0, 3, module.color, 1);
 
-    this.add([this.shapeGfx, this.fxGfx, this.glyphGfx, this.labelBox, this.beacon]);
+    this.add([this.shapeGfx, this.fxGfx, this.glyphGfx, this.beacon]);
 
-    // --- Статус-бейдж: парит над пипсами уровня ---
     this.statusBg = scene.add.graphics();
     this.statusText = scene.add
       .text(0, 0, "", {
@@ -347,14 +296,14 @@ class StationBuilding extends Phaser.GameObjects.Container {
     this.statusBadge.setVisible(false);
     this.add(this.statusBadge);
 
-    // Хит-зона = весь изометрический корпус + парящая подпись сверху
+    // Хит-зона = радиус пода + запас
+    const R = StationBuilding.POD_R;
     this.setInteractive({
-      hitArea: new Phaser.Geom.Rectangle(-74, -86, 148, 178),
-      hitAreaCallback: Phaser.Geom.Rectangle.Contains,
+      hitArea: new Phaser.Geom.Circle(0, 0, R + 16),
+      hitAreaCallback: Phaser.Geom.Circle.Contains,
       useHandCursor: true,
     });
 
-    // Визуальный отклик на наведение и нажатие
     this.on("pointerover", () => this.tweenScaleTo(this.baseScale * 1.05, 120));
     this.on("pointerout", () => this.tweenScaleTo(this.baseScale, 140));
     this.on("pointerdown", () => this.tweenScaleTo(this.baseScale * 0.95, 70));
@@ -367,36 +316,13 @@ class StationBuilding extends Phaser.GameObjects.Container {
         event: Phaser.Types.Input.EventData,
       ) => {
         event.stopPropagation();
-        if (this.locked) return;
         this.playClickImpulse();
         this.onSelect(this);
       },
     );
 
-    // Мягкая левитация подписи
-    scene.tweens.add({
-      targets: this.labelBox,
-      y: "-=5",
-      duration: 1600 + Math.random() * 400,
-      yoyo: true,
-      repeat: -1,
-      ease: "Sine.easeInOut",
-    });
-
-    // Мигание маячка на антенне
-    scene.tweens.add({
-      targets: this.beacon,
-      alpha: 0.15,
-      duration: 850,
-      yoyo: true,
-      repeat: -1,
-      ease: "Sine.easeInOut",
-      delay: Math.random() * 800,
-    });
-
     this.redraw();
     this.drawFx();
-    this.locked = this.level === 0;
     this.updateLockedVisuals();
     this.initFxTweens();
   }
@@ -405,65 +331,51 @@ class StationBuilding extends Phaser.GameObjects.Container {
     return this.level;
   }
 
-  /**
-   * Таймер стройки под названием отсека.
-   * null — прячет строку и возвращает подпись на место.
-   */
   setBuildCountdown(remainingMs: number | null): void {
     if (!this.buildText) {
       this.buildText = this.scene.add
-        .text(0, 27, "", {
-          fontSize: "13px",
+        .text(0, StationBuilding.POD_R + 14, "", {
+          fontSize: "10px",
           color: "#ffd700",
-          fontStyle: "bold",
+          fontStyle: 'bold',
+          fontFamily: 'Consolas, "Courier New", monospace',
         })
         .setOrigin(0.5);
-      this.labelBox.add(this.buildText);
+      this.add(this.buildText);
 
-      // Векторная иконка гаечного ключа вместо эмодзи
       this.wrenchGfx = this.scene.add.graphics();
       this.drawWrenchIcon(this.wrenchGfx, this.module.color, 7);
-      this.labelBox.add(this.wrenchGfx);
+      this.add(this.wrenchGfx);
     }
 
     if (remainingMs === null) {
       if (this.buildText.visible) {
         this.buildText.setVisible(false);
         this.wrenchGfx?.setVisible(false);
-        this.labelBox.setPosition(0, this.roofY - 16);
       }
       return;
     }
 
-    // Поднимаем подпись выше, чтобы таймер не наезжал на антенну
-    this.labelBox.setPosition(0, this.roofY - 30);
     this.buildText.setVisible(true);
     this.wrenchGfx?.setVisible(true);
     this.buildText.setText(formatDuration(remainingMs, true));
-    // Ключ слева от текста
-    this.wrenchGfx?.setPosition(-44, 27);
+    this.wrenchGfx?.setPosition(-14, StationBuilding.POD_R + 14);
   }
 
-  /** Маленькая векторная иконка гаечного ключа */
   private drawWrenchIcon(g: Phaser.GameObjects.Graphics, color: number, s: number): void {
     g.clear();
     g.lineStyle(1.8, color, 0.9);
-    // Ручка ключа (диагональ)
     g.lineBetween(-s, s, s * 0.3, -s * 0.3);
-    // Головка ключа (полукруг)
     g.beginPath();
     g.arc(s * 0.3, -s * 0.3, s * 0.45, -0.8, Math.PI * 0.6, false);
     g.strokePath();
-    // Зубцы
     g.lineBetween(s * 0.55, -s * 0.7, s * 0.55, -s * 0.2);
   }
 
-  /** Верхняя точка здания (для спавна бустов над крышей) */
   get roofY(): number {
-    return -(StationBuilding.HALF_H + 26);
+    return -(StationBuilding.POD_R + 22);
   }
 
-  /** Масштаб из layout; заодно сбрасывает незавершённые скейл-твины */
   setBaseScale(s: number): void {
     this.baseScale = s;
     this.scene.tweens.killTweensOf(this);
@@ -479,7 +391,6 @@ class StationBuilding extends Phaser.GameObjects.Container {
     });
   }
 
-  /** Импульс засчитанного клика: сжатие → отскок → возврат к базе */
   private playClickImpulse(): void {
     const tw = this.scene.tweens;
     tw.killTweensOf(this);
@@ -494,7 +405,6 @@ class StationBuilding extends Phaser.GameObjects.Container {
     });
   }
 
-  /** Перерисовка при изменении уровня: здание «растёт» вверх */
   refresh(level: number): void {
     this.level = level;
     this.locked = level === 0;
@@ -503,200 +413,230 @@ class StationBuilding extends Phaser.GameObjects.Container {
     this.updateLockedVisuals();
   }
 
-  /** Визуальное состояние заблокированного здания (уровень 0) */
   private updateLockedVisuals(): void {
-    // Затемняем корпус и иконку, отключаем луч в небо
     this.setAlpha(this.locked ? 0.4 : 1);
-    this.setInteractive({ useHandCursor: !this.locked });
   }
+
+  // ============================================================
+  // Отрисовка минималистичного неон-пода
+  // ============================================================
 
   private redraw(): void {
-    const { HALF_W, HALF_H, GLYPH_Y } = StationBuilding;
+    const R = StationBuilding.POD_R;
     const c = this.module.color;
-    const depth = 22 + this.level * 7; // высота стен растёт с уровнем
     const g = this.shapeGfx;
-
     g.clear();
-    drawLandingPad(g, HALF_W, HALF_H, depth, c);
 
-    // === БАЛАНС === Яркость отсеков: Finance и Design более сочные
-    const isoStyle: IsoStyle =
-      this.module.key === "finance"
-        ? { wallShadeDark: 0.58, wallShadeLight: 0.32, topFillAlpha: 0.6, edgeColor: 0xffd700 }
-        : this.module.key === "design"
-          ? { wallShadeDark: 0.55, wallShadeLight: 0.30, topFillAlpha: 0.6, edgeColor: 0xff1493 }
-          : {}; // engineering — дефолт
-    drawIsoStructure(g, HALF_W, HALF_H, depth, c, isoStyle);
+    // Внутренняя заливка (очень прозрачная)
+    g.fillStyle(c, 0.06);
 
-    // Векторная иконка отсека на крышке (поверх свечения)
-    drawSciFiIcon(this.glyphGfx, this.module.key, c, 12);
+    switch (this.module.key) {
+      case "engineering":
+        this.drawHexagon(g, 0, 0, R, c);
+        break;
+      case "finance":
+        this.drawCirclePod(g, 0, 0, R, c);
+        break;
+      case "design":
+        this.drawDiamond(g, 0, 0, R, c);
+        break;
+    }
 
-    // Свечение вокруг иконки-логотипа на крышке
-    const glyphAlpha = this.module.key === "engineering" ? 0.16 : 0.32;
-    g.fillStyle(c, glyphAlpha);
-    g.fillCircle(0, GLYPH_Y, 14);
-    g.lineStyle(1.2, c, this.module.key === "engineering" ? 0.4 : 0.7);
-    g.strokeCircle(0, GLYPH_Y, 14);
+    // Сегменты уровня вокруг формы
+    this.drawLevelSegments(g, R + 6, c);
 
-    // Антенна с мигающим маячком
-    g.lineStyle(1.5, c, 0.8);
-    g.lineBetween(0, -HALF_H, 0, -HALF_H - 16);
-    this.beacon.setPosition(0, -HALF_H - 18);
+    // Иконка модуля по центру
+    drawSciFiIcon(this.glyphGfx, this.module.key, c, 14);
 
-    // Подпись над зданием
-    this.labelBox.setPosition(0, this.roofY - 16);
-    this.drawPips();
+    // Beacon сверху
+    this.beacon.setPosition(0, -R - 4);
   }
 
-  /** Ромбовидные пипсы уровня над названием */
-  private drawPips(): void {
-    const g = this.pipsG;
-    g.clear();
-    const total = this.module.maxLevel;
-    for (let i = 0; i < total; i++) {
-      const px = (i - (total - 1) / 2) * 15;
-      const py = 13;
-      g.save();
-      g.translateCanvas(px, py);
-      g.rotateCanvas(Math.PI / 4);
-      if (i < this.level) {
-        g.fillStyle(this.module.color, 0.95);
-        g.fillRect(-4, -4, 8, 8);
-      } else {
-        g.lineStyle(1.2, this.module.color, 0.4);
-        g.strokeRect(-4, -4, 8, 8);
-      }
-      g.restore();
+  /** Шестиугольник (Engineering) */
+  private drawHexagon(
+    g: Phaser.GameObjects.Graphics,
+    cx: number,
+    cy: number,
+    r: number,
+    color: number,
+  ): void {
+    // Заливка
+    g.fillStyle(color, 0.08);
+    const pts = this.hexPoints(cx, cy, r);
+    g.fillPoints(pts, true);
+
+    // Контур
+    g.lineStyle(2, color, 0.9);
+    g.strokePoints(pts, true);
+
+    // Внутренняя сетка (горизонтальные линии — «схема»)
+    g.lineStyle(0.8, color, 0.2);
+    for (let i = -2; i <= 2; i++) {
+      const y = cy + i * (r * 0.35);
+      const hw = r * 0.85;
+      g.lineBetween(cx - hw, y, cx + hw, y);
     }
   }
 
-  // ================================================================
-  // Спецэффекты отсеков: сварка / волны / лазер + заблокированное
-  // ================================================================
+  /** Круг с кольцами (Finance) */
+  private drawCirclePod(
+    g: Phaser.GameObjects.Graphics,
+    cx: number,
+    cy: number,
+    r: number,
+    color: number,
+  ): void {
+    // Заливка
+    g.fillStyle(color, 0.08);
+    g.fillCircle(cx, cy, r);
 
-  /**
-   * Отрисовка анимационного слоя, специфичного для каждого отсека.
-   * Вызывается из redraw(). Анимации (твины) запускаются один раз
-   * в конструкторе через initFxTweens().
-   */
+    // Контур
+    g.lineStyle(2, color, 0.9);
+    g.strokeCircle(cx, cy, r);
+
+    // Внутренние кольца
+    g.lineStyle(0.8, color, 0.25);
+    g.strokeCircle(cx, cy, r * 0.7);
+    g.strokeCircle(cx, cy, r * 0.4);
+
+    // CR-ромб по центру (поверх иконки будет glyphGfx)
+    //小型 неоновый ромб валюты
+    const crY = cy + 16;
+    const crS = 6;
+    const hw = crS * 0.75;
+    g.lineStyle(1.2, 0xffb700, 0.8);
+    g.beginPath();
+    g.moveTo(0, crY - crS);
+    g.lineTo(hw, crY);
+    g.lineTo(0, crY + crS);
+    g.lineTo(-hw, crY);
+    g.closePath();
+    g.strokePath();
+    g.fillStyle(0xffb700, 0.35);
+    g.fillPath();
+  }
+
+  /** Ромб (Design) */
+  private drawDiamond(
+    g: Phaser.GameObjects.Graphics,
+    cx: number,
+    cy: number,
+    r: number,
+    color: number,
+  ): void {
+    const pts = [
+      new Phaser.Math.Vector2(cx, cy - r),
+      new Phaser.Math.Vector2(cx + r * 0.75, cy),
+      new Phaser.Math.Vector2(cx, cy + r),
+      new Phaser.Math.Vector2(cx - r * 0.75, cy),
+    ];
+
+    // Заливка
+    g.fillStyle(color, 0.08);
+    g.fillPoints(pts, true);
+
+    // Контур
+    g.lineStyle(2, color, 0.9);
+    g.strokePoints(pts, true);
+
+    // Внутренний орбитальный эллипс (атом)
+    g.lineStyle(0.8, color, 0.3);
+    g.strokeEllipse(cx, cy, r * 1.1, r * 0.6);
+    g.strokeEllipse(cx, cy, r * 0.6, r * 1.0);
+    // Ядро атома
+    g.fillStyle(0xffffff, 0.5);
+    g.fillCircle(cx, cy, 3);
+  }
+
+  /** Точки шестиугольника */
+  private hexPoints(cx: number, cy: number, r: number): Phaser.Math.Vector2[] {
+    const pts: Phaser.Math.Vector2[] = [];
+    for (let i = 0; i < 6; i++) {
+      const a = (Math.PI / 3) * i - Math.PI / 2;
+      pts.push(new Phaser.Math.Vector2(cx + r * Math.cos(a), cy + r * Math.sin(a)));
+    }
+    return pts;
+  }
+
+  /** Сегменты уровня: дуги вокруг pod (0 = тусклые, lv = залитые) */
+  private drawLevelSegments(
+    g: Phaser.GameObjects.Graphics,
+    radius: number,
+    color: number,
+  ): void {
+    const max = this.module.maxLevel;
+    const arcSpan = (2 * Math.PI) / max;
+    const gap = 0.06;
+
+    for (let i = 0; i < max; i++) {
+      const startA = arcSpan * i - Math.PI / 2 + gap;
+      const endA = arcSpan * (i + 1) - Math.PI / 2 - gap;
+      const filled = i < this.level;
+
+      if (filled) {
+        g.lineStyle(3, color, 0.95);
+      } else {
+        g.lineStyle(1.5, color, 0.2);
+      }
+
+      g.beginPath();
+      g.arc(0, 0, radius, startA, endA, false);
+      g.strokePath();
+    }
+  }
+
+  // ============================================================
+  // Спецэффекты отсеков
+  // ============================================================
+
   drawFx(): void {
     const g = this.fxGfx;
     g.clear();
     if (this.locked) return;
 
-    const { HALF_W: hw, HALF_H: hh } = StationBuilding;
+    const R = StationBuilding.POD_R;
     const c = this.module.color;
-    const depth = 22 + this.level * 7;
 
     switch (this.module.key) {
       case "engineering": {
-        // === СВАРКА: пульсирующие искры у правого шва корпуса ===
-        // Три точки сварки вдоль правого вертикального ребра
+        // Три искры вдоль нижнего правого края
         for (let i = 0; i < 3; i++) {
-          const sx = hw * 0.7 - i * 6;
-          const sy = hh * 0.5 + i * (depth / 4);
-          // Внешнее свечение искры
+          const angle = Math.PI * 0.25 + i * 0.3;
+          const sx = R * 0.7 * Math.cos(angle);
+          const sy = R * 0.7 * Math.sin(angle);
           g.fillStyle(0xffffff, 0.25);
-          g.fillCircle(sx, sy, 6 + i * 2);
-          // Ядро искры
+          g.fillCircle(sx, sy, 5 + i);
           g.fillStyle(0xffffff, 0.7);
-          g.fillCircle(sx, sy, 2);
+          g.fillCircle(sx, sy, 1.5);
         }
-        // Дым/пар от левого края крышки
-        g.fillStyle(c, 0.12);
-        g.fillCircle(-hw * 0.6, -hh * 0.4, 8);
-        g.fillCircle(-hw * 0.4, -hh * 0.8, 5);
         break;
       }
       case "finance": {
-        // === ЛУЧ: вертикальный пульсирующий столб + бегущие волны ===
-        const beamAlpha = 0.18 + this.level * 0.04;
-        g.lineStyle(3, c, beamAlpha);
-        g.lineBetween(0, -hh, 0, -100 - this.level * 10);
-        g.lineStyle(1, 0xffffff, beamAlpha * 0.6);
-        g.lineBetween(0, -hh, 0, -80 - this.level * 8);
-        // Бегущие световые полосы по рёбрам корпуса (статичные кадры)
-        const waveY = hh + depth * 0.3;
-        g.lineStyle(1.5, c, 0.35);
-        g.lineBetween(-hw * 0.3, waveY, hw * 0.3, waveY - hh * 0.4);
-        g.lineStyle(1, c, 0.2);
-        g.lineBetween(-hw * 0.5, waveY + 4, hw * 0.5, waveY - hh * 0.4 + 4);
-
-        // === CR: неоновый ромб валюты на фасаде здания ===
-        const crY = -hh * 0.1;
-        const crS = 9;
-        const hw2 = crS * 0.75;
-        // Гало
-        g.lineStyle(4, 0xffb700, 0.1);
-        g.beginPath();
-        g.moveTo(0, crY - crS);
-        g.lineTo(hw2, crY);
-        g.lineTo(0, crY + crS);
-        g.lineTo(-hw2, crY);
-        g.closePath();
-        g.strokePath();
-        // Верхний треугольник (ярче)
-        g.fillStyle(0xffb700, 0.5);
-        g.beginPath();
-        g.moveTo(0, crY - crS);
-        g.lineTo(hw2, crY);
-        g.lineTo(-hw2, crY);
-        g.closePath();
-        g.fillPath();
-        // Нижний треугольник (приглушённый)
-        g.fillStyle(0xffb700, 0.25);
-        g.beginPath();
-        g.moveTo(0, crY + crS);
-        g.lineTo(hw2, crY);
-        g.lineTo(-hw2, crY);
-        g.closePath();
-        g.fillPath();
-        // Контур
-        g.lineStyle(1.6, 0xffb700, 0.95);
-        g.beginPath();
-        g.moveTo(0, crY - crS);
-        g.lineTo(hw2, crY);
-        g.lineTo(0, crY + crS);
-        g.lineTo(-hw2, crY);
-        g.closePath();
-        g.strokePath();
-        // Блик
-        g.fillStyle(0xffffff, 0.85);
-        g.fillCircle(-hw2 * 0.25, crY - crS * 0.3, 1.2);
+        // Вертикальный луч вверх
+        const beamAlpha = 0.15 + this.level * 0.03;
+        g.lineStyle(2, c, beamAlpha);
+        g.lineBetween(0, -R, 0, -R - 30 - this.level * 8);
+        g.lineStyle(0.8, 0xffffff, beamAlpha * 0.5);
+        g.lineBetween(0, -R, 0, -R - 20 - this.level * 6);
         break;
       }
       case "design": {
-        // === ЛАЗЕР: горизонтальный сканирующий луч на крышке ===
-        // Линия сканирования (горизонтальна по крыше-ромбу)
-        g.lineStyle(1.8, c, 0.8);
-        g.lineBetween(-hw * 0.8, -hh * 0.2, hw * 0.8, -hh * 0.2);
-        // Конечные точки-марkerы
+        // Горизонтальный сканирующий луч
+        g.lineStyle(1.5, c, 0.7);
+        g.lineBetween(-R * 0.8, 0, R * 0.8, 0);
         g.fillStyle(0xffffff, 0.9);
-        g.fillCircle(-hw * 0.8, -hh * 0.2, 2.5);
-        g.fillCircle(hw * 0.8, -hh * 0.2, 2.5);
-        // Проекция silhouette корабля (маленький треугольник)
-        g.lineStyle(1.2, c, 0.55);
-        g.beginPath();
-        g.moveTo(0, -hh * 0.6);
-        g.lineTo(-6, -hh * 0.1);
-        g.lineTo(6, -hh * 0.1);
-        g.closePath();
-        g.strokePath();
+        g.fillCircle(-R * 0.8, 0, 2);
+        g.fillCircle(R * 0.8, 0, 2);
         break;
       }
     }
   }
 
-  /**
-   * Анимации FX-слоя: вызывается один раз из конструктора.
-   * Пульсирующие элементы (искры сварки, луч finance, сканер design).
-   */
   private initFxTweens(): void {
     if (this.locked) return;
 
     switch (this.module.key) {
-      case "engineering": {
-        // Пульс яркости искр сварки
+      case "engineering":
         this.scene.tweens.add({
           targets: this.fxGfx,
           alpha: { from: 1, to: 0.35 },
@@ -707,9 +647,7 @@ class StationBuilding extends Phaser.GameObjects.Container {
           delay: 150,
         });
         break;
-      }
-      case "finance": {
-        // Пульс ширины/яркости луча
+      case "finance":
         this.scene.tweens.add({
           targets: this.fxGfx,
           alpha: { from: 1, to: 0.5 },
@@ -719,9 +657,7 @@ class StationBuilding extends Phaser.GameObjects.Container {
           ease: "Sine.easeInOut",
         });
         break;
-      }
-      case "design": {
-        // Сканер: горизонтальное движение
+      case "design":
         this.scene.tweens.add({
           targets: this.fxGfx,
           x: { from: -4, to: 4 },
@@ -731,7 +667,6 @@ class StationBuilding extends Phaser.GameObjects.Container {
           ease: "Sine.easeInOut",
         });
         break;
-      }
     }
   }
 
@@ -882,17 +817,14 @@ class CommandCore extends Phaser.GameObjects.Container {
   private beacon!: Phaser.GameObjects.Arc;
   private labelBox!: Phaser.GameObjects.Container;
 
-  /** Верхняя точка ядра (для прокладки коридоров) */
   get roofY(): number {
-    return -(CommandCore.HALF_H + 26);
+    return -(CommandCore.HALF_H + 46);
   }
 
   constructor(scene: Phaser.Scene) {
     super(scene, 0, 0);
     const purple = COLOR_PURPLE;
 
-    // Пульсирующие кольца на площадке — отдельный Graphics со своим
-    // origin в центре эллипсов, чтобы твин масштаба расширял их симметрично
     this.ringGfx = scene.add.graphics();
     this.ringGfx.setPosition(0, CommandCore.HALF_H + CommandCore.DEPTH + 2);
     this.ringGfx.lineStyle(1.5, purple, 0.3);
@@ -902,16 +834,15 @@ class CommandCore extends Phaser.GameObjects.Container {
 
     this.shapeGfx = scene.add.graphics();
 
-    // Иконка реактора как светящаяся проекция на крышке
     const glyphGlow = scene.add.graphics();
     glyphGlow.fillStyle(purple, 0.22);
     glyphGlow.fillCircle(0, CommandCore.GLYPH_Y, 17);
     glyphGlow.lineStyle(1.2, purple, 0.5);
     glyphGlow.strokeCircle(0, CommandCore.GLYPH_Y, 17);
+
     const iconGfx = scene.add.graphics();
     iconGfx.setPosition(0, CommandCore.GLYPH_Y);
 
-    // Парящая подпись
     const label = scene.add
       .text(0, 0, "COMMAND CORE", {
         fontSize: "14px",
@@ -919,9 +850,8 @@ class CommandCore extends Phaser.GameObjects.Container {
         fontStyle: "bold",
       })
       .setOrigin(0.5);
-    this.labelBox = scene.add.container(0, -(CommandCore.HALF_H + 46), [label]);
+    this.labelBox = scene.add.container(0, -(CommandCore.HALF_H + 52), [label]);
 
-    // Белый маячок на антенне
     this.beacon = scene.add.circle(0, 0, 3.5, 0xffffff, 1);
 
     this.add([this.ringGfx, this.shapeGfx, glyphGlow, iconGfx, this.labelBox, this.beacon]);
@@ -929,7 +859,6 @@ class CommandCore extends Phaser.GameObjects.Container {
     this.drawBody();
     drawSciFiIcon(iconGfx, "core", purple, 15);
 
-    // Пульс колец площадки
     scene.tweens.add({
       targets: this.ringGfx,
       scale: 1.1,
@@ -940,7 +869,6 @@ class CommandCore extends Phaser.GameObjects.Container {
       ease: "Sine.easeInOut",
     });
 
-    // Левитация подписи
     scene.tweens.add({
       targets: this.labelBox,
       y: "-=5",
@@ -950,7 +878,6 @@ class CommandCore extends Phaser.GameObjects.Container {
       ease: "Sine.easeInOut",
     });
 
-    // Частое мигание маячка
     scene.tweens.add({
       targets: this.beacon,
       alpha: 0.1,
@@ -961,22 +888,59 @@ class CommandCore extends Phaser.GameObjects.Container {
     });
   }
 
-  private drawBody(): void {
-    const { HALF_W, HALF_H, DEPTH } = CommandCore;
-    const g = this.shapeGfx;
+private drawBody(): void {
+  const { HALF_W, HALF_H, DEPTH } = CommandCore;
+  const g = this.shapeGfx;
 
-    g.clear();
-    drawIsoStructure(g, HALF_W, HALF_H, DEPTH, COLOR_PURPLE, {
-      topFillColor: 0xffffff,
-      edgeColor: COLOR_PURPLE,
-    });
+  g.clear();
 
-    // Двойная антенна с белым маячком
-    g.lineStyle(1.5, COLOR_PURPLE, 0.9);
-    g.lineBetween(0, -HALF_H, 0, -HALF_H - 20);
-    g.lineBetween(-7, -HALF_H * 0.6, -7, -HALF_H * 0.6 - 12);
-    this.beacon.setPosition(0, -HALF_H - 22);
-  }
+  // 1. Рисуем базовый корпус
+  drawIsoStructure(g, HALF_W, HALF_H, DEPTH, COLOR_PURPLE, {
+    topFillColor: 0xffffff,
+    edgeColor: COLOR_PURPLE,
+  });
+
+  // 2. БИО-КУПОЛ (опирается прямо на силовое поле снизу)
+  const domeRx = HALF_W + 55;      // Ширина по эллипсу площадки
+  const domeRy = 50;               // Сплюснутость под изометрию
+  const domeCenterY = 55; // Опускаем нижний край ровно к кольцам
+
+  // Внутреннее свечение кислорода
+  g.fillStyle(COLOR_CYAN, 0.12);
+  g.fillEllipse(0, domeCenterY, domeRx * 2, domeRy * 2);
+
+  // Полупрозрачная купольная заливка
+  g.fillStyle(0x00f0ff, 0.13);
+  g.beginPath();
+  g.arc(0, domeCenterY, domeRx, Math.PI, 0, false);
+  g.closePath();
+  g.fillPath();
+
+  // Основной неоновый контур купола
+  g.lineStyle(2, COLOR_CYAN, 0.85);
+  g.strokeEllipse(0, domeCenterY, domeRx * 2, domeRy * 2);
+
+  // Горизонтальные ребра жесткости (экваториальные кольца)
+  // g.lineStyle(1, COLOR_CYAN, 0.4);
+  // g.strokeEllipse(0, domeCenterY - 18, domeRx * 1.8, domeRy * 1.2);
+  // g.lineStyle(1, 0xffffff, 0.25);
+  // g.strokeEllipse(0, domeCenterY + 12, domeRx * 1.9, domeRy * 1.4);
+
+  // Блик на стекле купола
+  g.fillStyle(0xffffff, 0.7);
+  g.fillCircle(-domeRx * 0.45, domeCenterY - domeRy * 0.4, 3.5);
+  g.fillStyle(0xffffff, 0.4);
+  g.fillCircle(-domeRx * 0.35, domeCenterY - domeRy * 0.5, 2);
+
+  // 3. Антенна над верхней точкой купола
+  // const topOfDomeY = domeCenterY - domeRy;
+  // g.lineStyle(2, COLOR_PURPLE, 0.95);
+  // g.lineBetween(0, topOfDomeY, 0, topOfDomeY - 22);
+  // g.lineStyle(1.5, COLOR_CYAN, 0.8);
+  // g.lineBetween(-8, topOfDomeY - 10, 8, topOfDomeY - 10);
+
+  // this.beacon.setPosition(0, topOfDomeY - 24);
+}
 }
 
 // ============================================================
@@ -1338,6 +1302,8 @@ export class StationScene extends Phaser.Scene {
   private commandCore!: CommandCore;
   private connectorGfx!: Phaser.GameObjects.Graphics;
   private pulses: Phaser.GameObjects.Container[] = [];
+  private infoPanel!: Phaser.GameObjects.Container;
+  private infoPanelBg!: Phaser.GameObjects.Graphics;
 
   constructor() {
     super("Station");
@@ -1346,6 +1312,13 @@ export class StationScene extends Phaser.Scene {
   create(): void {
     this.cameras.main.setBackgroundColor(COLOR_BG);
     this.cameras.main.fadeIn(300, 0, 0, 0);
+
+    // Синхронизируем BP при входе на станцию (Design Wing генерирует пассивно)
+    GameState.syncBlueprints();
+    void gameServices.updateBlueprintsToCloud(
+      GameState.getBlueprints(),
+      GameState.getLastBpTimestamp(),
+    );
 
     this.gridGraphics = this.add.graphics().setDepth(0);
     // Заголовок прижат к левому краю под кнопкой BACK — правый верхний
@@ -1375,6 +1348,7 @@ export class StationScene extends Phaser.Scene {
     this.add.existing(this.commandCore);
 
     this.createBuildings();
+    this.createInfoPanel();
     this.startBoostProduction();
 
     // Стройки, завершившиеся пока игрок был вне станции
@@ -1409,6 +1383,79 @@ export class StationScene extends Phaser.Scene {
       building.setDepth(10);
       this.add.existing(building);
       return building;
+    });
+  }
+
+  // --- Нижняя инфо-панель: иконка + название + шкала уровня ---
+  private createInfoPanel(): void {
+    this.infoPanelBg = this.add.graphics().setDepth(40);
+    this.infoPanel = this.add.container(0, 0).setDepth(41);
+    this.refreshInfoPanel();
+  }
+
+  private refreshInfoPanel(): void {
+    this.infoPanel.removeAll(true);
+    const w = this.scale.width;
+    const h = this.scale.height;
+    const pad = 12;
+    const panelH = 72;
+    const panelY = h - panelH / 2 - pad;
+
+    // Полупрозрачный фон на всю ширину
+    this.infoPanelBg.clear();
+    this.infoPanelBg.fillStyle(COLOR_DARK_PANEL, 0.82);
+    this.infoPanelBg.fillRoundedRect(pad, panelY - panelH / 2, w - pad * 2, panelH, 10);
+    this.infoPanelBg.lineStyle(1, COLOR_CYAN, 0.25);
+    this.infoPanelBg.strokeRoundedRect(pad, panelY - panelH / 2, w - pad * 2, panelH, 10);
+
+    const slotW = (w - pad * 2) / MODULES.length;
+    const levels = GameState.getStation();
+
+    MODULES.forEach((mod, i) => {
+      const cx = pad + slotW * i + slotW / 2;
+
+      // Иконка модуля (векторная)
+      const iconG = this.add.graphics();
+      drawSciFiIcon(iconG, mod.key, mod.color, 14);
+      iconG.setPosition(cx - 50, panelY - 2);
+      this.infoPanel.add(iconG);
+
+      // Название
+      const name = this.add.text(cx - 34, panelY - 12, mod.title, {
+        fontSize: "12px",
+        color: "#ffffff",
+        fontStyle: "bold",
+        fontFamily: 'Consolas, "Courier New", monospace',
+      }).setOrigin(0, 0.5);
+      this.infoPanel.add(name);
+
+      // Шкала уровня
+      const lv = levels[mod.key];
+      const barG = this.add.graphics();
+      const segW = 10;
+      const gap = 2;
+      const totalW = mod.maxLevel * segW + (mod.maxLevel - 1) * gap;
+      const startX = cx - 34;
+      const barY = panelY + 8;
+      for (let j = 0; j < mod.maxLevel; j++) {
+        const sx = startX + j * (segW + gap);
+        if (j < lv) {
+          barG.fillStyle(mod.color, 0.95);
+          barG.fillRect(sx, barY, segW, 5);
+        } else {
+          barG.lineStyle(1, mod.color, 0.4);
+          barG.strokeRect(sx, barY, segW, 5);
+        }
+      }
+      this.infoPanel.add(barG);
+
+      // Lv.N справа
+      const lvText = this.add.text(cx - 34 + totalW + 8, panelY + 8, `Lv.${lv}`, {
+        fontSize: "11px",
+        color: "#aaaaaa",
+        fontFamily: 'Consolas, "Courier New", monospace',
+      }).setOrigin(0, 0);
+      this.infoPanel.add(lvText);
     });
   }
 
@@ -1682,9 +1729,14 @@ export class StationScene extends Phaser.Scene {
           this.buildings.find((b) => b.module.key === key)?.refresh(freshLevels[key]);
           const title = MODULES.find((m) => m.key === key)?.title ?? key;
           this.showToast(`${title} ONLINE`, COLOR_CYAN);
+          // === БАЛАНС: при достройке Design Wing сбрасываем таймер BP ===
+          if (key === "design") {
+            GameState.setLastBpTimestamp(Date.now());
+          }
         });
         // Модалка сама перерисуется, если её модуль достроен (с guard'ом)
         this.modal?.tick();
+        this.refreshInfoPanel();
       }
   }
 
@@ -1721,12 +1773,16 @@ export class StationScene extends Phaser.Scene {
 
     // Мета-прогресс сразу уезжает в облако (fire-and-forget)
     const skinId = getSelectedSkin().id;
+    const custom = loadCustomization();
     void gameServices.saveProgress({
       achievements: [],
       selectedShip: skinId,
       selectedSkin: skinId,
       stationLevels: levels,
       coins: GameState.getCoins(),
+      blueprints: GameState.getBlueprints(),
+      lastBpTimestamp: GameState.getLastBpTimestamp(),
+      customization: custom,
     });
     return true;
   }
@@ -1836,7 +1892,7 @@ export class StationScene extends Phaser.Scene {
 
     const slots = [
       { x: w * 0.25, y: h * 0.73 }, // ENGINEERING BAY — слева внизу
-      { x: w * 0.5, y: h * 0.32 },  // FINANCE OFFICE — сверху (ниже, чтобы не наезжал на шапку)
+      { x: w * 0.5, y: h * 0.28 },  // FINANCE OFFICE — выше центра
       { x: w * 0.75, y: h * 0.73 }, // DESIGN WING — справа внизу
     ];
     this.buildings.forEach((building, index) => {
@@ -1845,6 +1901,7 @@ export class StationScene extends Phaser.Scene {
     });
 
     this.rebuildCorridors(corePos, slots, baseScale);
+    this.refreshInfoPanel();
   }
 
   /**

@@ -3,6 +3,7 @@ import { MainMenuScene } from './scenes/MainMenuScene';
 import { LeaderboardScene } from './scenes/LeaderboardScene';
 import { SettingsScene } from './scenes/SettingsScene';
 import { StationScene } from './scenes/StationScene';
+import { GarageScene } from './scenes/GarageScene';
 import { AUTO, Game, Scale, Types } from 'phaser';
 import { gameServices } from '../services/GameServicesManager';
 
@@ -32,7 +33,7 @@ const config: Types.Core.GameConfig = {
         mode: Scale.RESIZE,
         autoCenter: Scale.CENTER_BOTH
     },
-    scene: [MainMenuScene, MainGame, LeaderboardScene, SettingsScene, StationScene]
+    scene: [MainMenuScene, MainGame, LeaderboardScene, SettingsScene, StationScene, GarageScene]
 };
 
 // Облачный сервис (Firebase через адаптер) — инициализация при старте.
