@@ -23,10 +23,8 @@
             touch-action: none; /* Запрещает свайпы браузера */
         }
         #game-container {
-            /* Ограничиваем ширину игры на больших экранах */
+            /* Desktop-first: canvas заполняет весь viewport (без чёрных полос) */
             width: 100%;
-            max-width: 800px;
-            margin: 0 auto;
             height: 100%;
             display: flex;
             justify-content: center;
@@ -48,7 +46,6 @@
         #splash img {
             width: 100%;
             height: 100%;
-            max-width: 800px;
             object-fit: cover;
         }
         #splash .spinner {
@@ -69,7 +66,7 @@
             pointer-events: none;
         }
     </style>
-  <script type="module" crossorigin src="./assets/index-C2NE3c98.js"></script>
+  <script type="module" crossorigin src="./assets/index-ChxvttvV.js"></script>
   <link rel="modulepreload" crossorigin href="./assets/phaser-K_86XjOm.js">
 </head>
 <body>
