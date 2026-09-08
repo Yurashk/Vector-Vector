@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Neon Drift</title>
+    <link rel="icon" type="image/x-icon" href="./favicon.ico">
+    <script src="https://sdk.crazygames.com/crazygames-sdk-v3.js"></script>
+    <style>
+        * {
+            box-sizing: border-box;
+            user-select: none;
+            -webkit-user-select: none;
+            margin: 0;
+            padding: 0;
+        }
+        html, body {
+            width: 100%;
+            /* 100dvh решает проблему срезанной высоты на мобилках */
+            height: 100dvh; 
+            background-color: #05080f;
+            /* Неоновый тёмно-синий фон: подсвечиваемые зоны вверху (cyan)
+               и внизу (purple), читаемый градиент между ними */
+            background-image:
+                radial-gradient(1200px 600px at 50% -10%, rgba(0, 240, 255, 0.16), transparent 60%),
+                radial-gradient(900px 520px at 50% 115%, rgba(157, 0, 255, 0.14), transparent 60%),
+                linear-gradient(180deg, #0b1330 0%, #060a1d 55%, #030512 100%);
+            overflow: hidden;
+            touch-action: none; /* Запрещает свайпы браузера */
+        }
+        #game-container {
+            /* Канвас занимает ВЕСЬ экран: режим Phaser Scale.RESIZE выставляет
+               его размер под окно (100vw / 100vh). Никакого CSS-скейла и
+               центрирования здесь нет — игра работает в координатах окна,
+               UI якорится к краям экрана. */
+            width: 100%;
+            height: 100%;
+            /* Контейнер сам по себе не должен перехватывать тач/клики —
+               иначе он «накрывает» canvas поверхностным слоем и блокирует
+               pointer-события для корабля на мобильных. Интерактивен только
+               сам canvas (и DOM-кнопки, которых здесь нет). */
+            pointer-events: none;
+        }
+        /* Сам canvas и любые обёртки Phaser получают input обратно */
+        #game-container canvas,
+        #game-container .phaser-root,
+        #game-container .phaser-container {
+            pointer-events: auto;
+        }
+        /* Канвас: без рамок и скруглений — полный экран к краю в край */
+        #game-container canvas {
+            background: #0a0a14;
+            display: block;
+        }
+
+        /* Сплаш-экран поверх чёрного экрана во время инициализации SDK */
+        #splash {
+            position: fixed;
+            inset: 0;
+            z-index: 9999;
+            background: #000;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            transition: opacity 0.4s ease;
+        }
+        #splash img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        #splash .spinner {
+            position: absolute;
+            bottom: 12%;
+            width: 28px;
+            height: 28px;
+            border: 3px solid rgba(0, 240, 255, 0.25);
+            border-top-color: #00f0ff;
+            border-radius: 50%;
+            animation: spin 0.9s linear infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        #splash.hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
+    </style>
+  <script type="module" crossorigin src="./assets/index-60k_RqBG.js"></script>
+  <link rel="modulepreload" crossorigin href="./assets/phaser-D6HPxZF7.js">
+</head>
+<body>
+    <div id="game-container"></div>
+
+    <!-- Сплаш: прячется через window.hideSplash() после загрузки игры -->
+    <div id="splash">
+        <img src="./assets/main-window-D2HZaQS0.jpg" alt="">
+        <div class="spinner"></div>
+    </div>
+
+</body>
+</html>
