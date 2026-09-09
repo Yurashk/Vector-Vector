@@ -58,7 +58,7 @@
             position: fixed;
             inset: 0;
             z-index: 9999;
-            background: #000;
+            background: #05080f;
             display: flex;
             flex-direction: column;
             align-items: center;
@@ -70,9 +70,22 @@
             height: 100%;
             object-fit: cover;
         }
+        /* Портретные экраны (мобильные): широкий баннер целиком не обрезается —
+           contain + неоновая заливка в тему, чтобы не было чёрных полей */
+        @media (orientation: portrait) {
+            #splash {
+                background:
+                    radial-gradient(90vw 45vh at 50% -10%, rgba(0, 240, 255, 0.18), transparent 60%),
+                    radial-gradient(80vw 40vh at 50% 115%, rgba(157, 0, 255, 0.16), transparent 60%),
+                    linear-gradient(180deg, #0b1330 0%, #060a1d 55%, #030512 100%);
+            }
+            #splash img {
+                object-fit: contain;
+            }
+        }
         #splash .spinner {
             position: absolute;
-            bottom: 12%;
+            bottom: 5%;
             width: 28px;
             height: 28px;
             border: 3px solid rgba(0, 240, 255, 0.25);
