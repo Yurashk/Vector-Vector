@@ -94,9 +94,15 @@
 <body>
     <div id="game-container"></div>
 
-    <!-- Сплаш: прячется через window.hideSplash() после загрузки игры -->
+    <!-- Сплаш: прячется через window.hideSplash() после загрузки игры.
+         Респонсивный srcset: мобильный 640w / плэншет 1000w / десктоп 1366w.
+         sizes="100vw" — браузер выбирает подходящий по ширине viewport. -->
     <div id="splash">
-        <img src="./assets/main-window-Bn4FCDlr.jfif" alt="">
+        <img
+            src="./assets/main-window-Bn4FCDlr.jfif"
+            srcset="./assets/splash-640.jpg 640w, ./assets/splash-1000.jpg 1000w, ./assets/splash-1366.jpg 1366w"
+            sizes="100vw"
+            alt="">
         <div class="spinner"></div>
     </div>
 
